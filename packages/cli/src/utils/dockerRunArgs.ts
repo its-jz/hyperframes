@@ -21,7 +21,7 @@ export interface DockerRunArgsInput {
 export interface DockerRenderOptions {
   fps: 24 | 30 | 60;
   quality: "draft" | "standard" | "high";
-  format: "mp4" | "webm" | "mov";
+  format: "mp4" | "webm" | "mov" | "png-sequence";
   workers?: number;
   gpu: boolean;
   browserGpu: boolean;
@@ -29,6 +29,10 @@ export interface DockerRenderOptions {
   crf?: number;
   videoBitrate?: string;
   quiet: boolean;
+  variables?: Record<string, unknown>;
+  entryFile?: string;
+  /** Output resolution preset (e.g. "landscape-4k"). Forwarded as `--resolution`. */
+  outputResolution?: string;
 }
 
 export function buildDockerRunArgs(input: DockerRunArgsInput): string[] {
@@ -63,5 +67,10 @@ export function buildDockerRunArgs(input: DockerRunArgsInput): string[] {
     ...(options.browserGpu ? [] : ["--no-browser-gpu"]),
     ...(options.hdrMode === "force-hdr" ? ["--hdr"] : []),
     ...(options.hdrMode === "force-sdr" ? ["--sdr"] : []),
+    ...(options.variables && Object.keys(options.variables).length > 0
+      ? ["--variables", JSON.stringify(options.variables)]
+      : []),
+    ...(options.entryFile ? ["--composition", options.entryFile] : []),
+    ...(options.outputResolution ? ["--resolution", options.outputResolution] : []),
   ];
 }

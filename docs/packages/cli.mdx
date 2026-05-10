@@ -129,6 +129,10 @@ This is suppressed in CI environments, non-TTY shells, and when `HYPERFRAMES_NO_
     ```bash
     npx hyperframes render --output output.mp4
     ```
+    Render a specific composition instead of `index.html`:
+    ```bash
+    npx hyperframes render -c compositions/intro.html -o intro.mp4
+    ```
     For deterministic output, add `--docker`:
     ```bash
     npx hyperframes render --docker --output output.mp4
@@ -158,6 +162,7 @@ This is suppressed in CI environments, non-TTY shells, and when `HYPERFRAMES_NO_
     | Flag | Description |
     |------|-------------|
     | `--example, -e` | Example to scaffold (required in default mode, interactive in `--human-friendly`) |
+    | `--resolution` | Canvas preset: `landscape` (1920×1080), `portrait` (1080×1920), `landscape-4k` (3840×2160), `portrait-4k` (2160×3840). Aliases: `1080p`, `4k`, `uhd`. Default: keep template dimensions. |
     | `--video, -V` | Path to a video file (MP4, WebM, MOV) |
     | `--audio, -a` | Path to an audio file (MP3, WAV, M4A) |
     | `--tailwind` | Add Tailwind CSS browser-runtime support to scaffolded HTML |
@@ -341,6 +346,59 @@ This is suppressed in CI environments, non-TTY shells, and when `HYPERFRAMES_NO_
     <Tip>
       Combine `tts` with `transcribe` to generate narration and word-level timestamps for captions in a single workflow: generate the audio with `tts`, then transcribe the output with `transcribe` to get word-level timing.
     </Tip>
+
+    ### `remove-background`
+
+    Remove the background from a video or image using a local AI model. The output is transparent media you can drop into any composition's `<video>` or `<img>` element — no green screen required.
+
+    ```bash
+    # Default: VP9-with-alpha WebM (HTML5-native, ~1 MB / 4s @ 1080p)
+    npx hyperframes remove-background avatar.mp4 -o transparent.webm
+
+    # ProRes 4444 .mov for editing round-trip
+    npx hyperframes remove-background avatar.mp4 -o transparent.mov
+
+    # Single image → transparent PNG
+    npx hyperframes remove-background portrait.jpg -o cutout.png
+
+    # Layer separation: cutout AND inverse-alpha background plate in one pass
+    npx hyperframes remove-background avatar.mp4 \
+      -o subject.webm --background-output plate.webm
+
+    # Force CPU on a machine that has CoreML or CUDA
+    npx hyperframes remove-background avatar.mp4 -o transparent.webm --device cpu
+
+    # Inspect detected providers without rendering
+    npx hyperframes remove-background --info
+    ```
+
+    | Flag | Description |
+    |------|-------------|
+    | `--output, -o` | Output path. Format inferred from extension: `.webm` (default), `.mov`, `.png` |
+    | `--background-output, -b` | Optional second output: inverse-alpha background plate (subject region transparent, surroundings opaque). Same source RGB, complementary mask. Must be `.webm` or `.mov`. Hole-cut, not inpainted — composite something underneath to fill the hole. |
+    | `--device` | Execution provider: `auto` (default), `cpu`, `coreml`, `cuda` |
+    | `--quality` | WebM encoder preset: `fast` (crf 30, smallest), `balanced` (crf 18, default), `best` (crf 12, near-lossless). Higher quality keeps the cutout's RGB closer to the source mp4 — important when overlaying the cutout on its own source for text-behind-subject effects. Applies to both `--output` and `--background-output`. Ignored for `.mov` / `.png`. |
+    | `--info` | Print detected execution providers and exit (no render) |
+    | `--json` | Output result as JSON |
+
+    The model is `u2net_human_seg` (MIT, ~168 MB ONNX). Weights download to `~/.cache/hyperframes/background-removal/models/` on first run and are reused thereafter. Peak inference RAM is ~1.5 GB.
+
+    `--device auto` picks CoreML on Apple Silicon, CUDA when available, and CPU otherwise. The CLI bundles the CPU build of `onnxruntime-node`; for CUDA, set `HYPERFRAMES_CUDA=1` and provide a GPU-enabled `onnxruntime-node` build.
+
+    Output formats:
+
+    | Format | Use case | Size (4s @ 1080p) |
+    |--------|----------|-------------------|
+    | `.webm` (VP9 alpha) | Drop into `<video>` for HTML5-native transparent playback | ~1 MB |
+    | `.mov` (ProRes 4444) | Editing round-trip in Premiere / Resolve / DaVinci | ~50 MB |
+    | `.png` | Single-image cutout | varies |
+
+    <Tip>
+      The `<video>` element in Chrome only respects the alpha plane when the WebM is encoded as `yuva420p` with the `alpha_mode=1` metadata tag. The CLI sets both automatically — if you re-encode the output yourself, preserve those flags.
+    </Tip>
+
+    See the [Remove Background guide](/guides/remove-background) for the full workflow — using transparent videos in compositions, performance per platform, limitations of `u2net_human_seg`, and free alternative tools when this model isn't the right fit.
+
     ### `capture`
 
     Capture a website — extract screenshots, design tokens, fonts, assets, and animations for video production:
@@ -547,11 +605,12 @@ This is suppressed in CI environments, non-TTY shells, and when `HYPERFRAMES_NO_
     | Flag | Values | Default | Description |
     |------|--------|---------|-------------|
     | `--output` | path | `renders/<name>.mp4` | Output file path |
-    | `--format` | mp4, webm, mov | mp4 | Output format (WebM/MOV render with transparency) |
+    | `--format` | mp4, webm, mov, png-sequence | mp4 | Output format (WebM/MOV render with transparency; png-sequence writes a directory of RGBA PNGs) |
     | `--fps` | 24, 30, 60 | 30 | Frames per second |
     | `--quality` | draft, standard, high | standard | Encoding quality preset (drives CRF/bitrate) |
     | `--crf` | 0-51 | — | Override encoder CRF (lower = higher quality). Mutually exclusive with `--video-bitrate` |
     | `--video-bitrate` | e.g. `10M`, `5000k` | — | Target video bitrate. Mutually exclusive with `--crf` |
+    | `--resolution` | landscape, portrait, landscape-4k, portrait-4k (aliases: `1080p`, `4k`, `uhd`) | — | Output resolution preset. Supersamples a smaller composition via Chrome `deviceScaleFactor` so the screenshot lands at the requested dimensions. Aspect ratio must match the composition; the scale must be an integer multiple. Not supported with `--hdr`. See [4K Rendering](/guides/4k-rendering) |
     | `--hdr` | — | off | Force HDR output even if no HDR sources are detected. MP4 only. See [HDR Rendering](/guides/hdr) |
     | `--sdr` | — | off | Force SDR output even if HDR sources are detected |
     | `--workers` | 1-8 | 4 | Parallel render workers |
@@ -559,8 +618,49 @@ This is suppressed in CI environments, non-TTY shells, and when `HYPERFRAMES_NO_
     | `--browser-gpu` / `--no-browser-gpu` | — | on locally, off in Docker | Use or opt out of host GPU acceleration for local Chrome/WebGL capture |
     | `--docker` | — | off | Use Docker for [deterministic rendering](/concepts/determinism) |
     | `--quiet` | — | off | Suppress verbose output |
+    | `--variables` | JSON object | — | Variable overrides merged over `data-composition-variables` defaults. Read via `window.__hyperframes.getVariables()` |
+    | `--variables-file` | path | — | Path to a JSON file with variable overrides (alternative to `--variables`) |
+    | `--strict-variables` | — | off | Fail render if any `--variables` key is undeclared or has a wrong type vs the composition's `data-composition-variables`. Without this flag, mismatches print as warnings and the render continues. |
 
     CRF and target bitrate default to the `--quality` preset. Use `--crf` or `--video-bitrate` for fine-grained overrides; `RenderConfig.crf` and `RenderConfig.videoBitrate` accept the same overrides programmatically.
+
+    #### Parametrized renders
+
+    Render the same composition with different content by declaring variables on the composition root and overriding them at render time:
+
+    ```html index.html
+    <html
+      data-composition-id="root"
+      data-composition-variables='[
+        {"id":"title","label":"Title","type":"string","default":"Hello"},
+        {"id":"theme","label":"Theme","type":"enum","options":[
+          {"value":"light","label":"Light"},
+          {"value":"dark","label":"Dark"}
+        ],"default":"light"}
+      ]'>
+      <body>
+        <h1 id="hero" class="clip" data-start="0" data-duration="3"></h1>
+        <script>
+          const vars = window.__hyperframes.getVariables();
+          document.getElementById("hero").textContent = vars.title;
+          document.body.dataset.theme = vars.theme;
+        </script>
+      </body>
+    </html>
+    ```
+
+    ```bash
+    # Render with declared defaults (preview also uses the defaults)
+    npx hyperframes render --output default.mp4
+
+    # Override at render time — missing keys fall through to declared defaults
+    npx hyperframes render --variables '{"title":"Q4 Report","theme":"dark"}' --output q4.mp4
+
+    # Pass values from a JSON file
+    npx hyperframes render --variables-file ./vars.json --output out.mp4
+    ```
+
+    `getVariables()` returns the merged result of declared defaults and any `--variables` overrides, so the same composition runs unchanged in dev preview and in production renders.
 
     #### WebM with Transparency
 
@@ -618,7 +718,19 @@ This is suppressed in CI environments, non-TTY shells, and when `HYPERFRAMES_NO_
       ◇  All checks passed
     ```
 
+    | Flag | Description |
+    |------|-------------|
+    | `--json` | Output as JSON (includes `_meta` envelope) |
+
     Verifies CLI version, Node.js, FFmpeg, FFprobe, Chrome, and Docker availability. If a newer CLI version is available, the version row shows an upgrade hint.
+
+    **CI gating.** `hyperframes doctor --json` always exits 0 on successful execution — the command succeeded if it produced valid output. Whether the environment is healthy is carried in the `ok` field of the payload, so a new CLI release (which flips `Version.ok` to `false`) never breaks your pipeline. Pipe through `jq` to gate on the payload instead:
+
+    ```bash
+    hyperframes doctor --json | jq -e '.ok' > /dev/null || handle_failure
+    ```
+
+    Paths in `detail` and `hint` are redacted in JSON mode — the user's home directory is replaced with the literal `$HOME` so output is safe to paste into bug reports and agent contexts.
 
     ### `info`
 

@@ -1,16 +1,33 @@
 import { defineCommand } from "citty";
 import type { Example } from "./_examples.js";
-import { mkdirSync, readFileSync, statSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync, rmSync } from "node:fs";
 
 export const examples: Example[] = [
   ["Render to MP4", "hyperframes render --output output.mp4"],
+  ["Render a specific composition", "hyperframes render -c compositions/intro.html -o intro.mp4"],
+  [
+    "Upsample any composition to 4K (supersamples via Chrome DPR)",
+    "hyperframes render --resolution 4k --output 4k.mp4",
+  ],
   ["Render transparent overlay (ProRes)", "hyperframes render --format mov --output overlay.mov"],
   ["Render transparent WebM overlay", "hyperframes render --format webm --output overlay.webm"],
+  [
+    "Render PNG sequence (RGBA frames for AE/Nuke/Fusion)",
+    "hyperframes render --format png-sequence --output frames/",
+  ],
   ["High quality at 60fps", "hyperframes render --fps 60 --quality high --output hd.mp4"],
   ["Deterministic render via Docker", "hyperframes render --docker --output deterministic.mp4"],
   ["Parallel rendering with 6 workers", "hyperframes render --workers 6 --output fast.mp4"],
   ["Opt out of browser GPU render", "hyperframes render --no-browser-gpu --output cpu.mp4"],
   ["HDR output (auto-detected)", "hyperframes render --output hdr-output.mp4"],
+  [
+    "Override composition variables (parametrized render)",
+    'hyperframes render --variables \'{"title":"Q4 Report","theme":"dark"}\' --output q4.mp4',
+  ],
+  [
+    "Variables from a JSON file",
+    "hyperframes render --variables-file ./vars.json --output out.mp4",
+  ],
 ];
 import { cpus, freemem, tmpdir } from "node:os";
 import { resolve, dirname, join, basename } from "node:path";
@@ -27,25 +44,48 @@ import { bytesToMb } from "../telemetry/system.js";
 import { VERSION } from "../version.js";
 import { isDevMode } from "../utils/env.js";
 import { buildDockerRunArgs } from "../utils/dockerRunArgs.js";
+import { ensureDOMParser } from "../utils/dom.js";
 import type { RenderJob } from "@hyperframes/producer";
+import {
+  extractCompositionMetadata,
+  validateVariables,
+  formatVariableValidationIssue,
+  normalizeResolutionFlag,
+  type VariableValidationIssue,
+  type CanvasResolution,
+} from "@hyperframes/core";
 
 const VALID_FPS = new Set([24, 30, 60]);
 const VALID_QUALITY = new Set(["draft", "standard", "high"]);
-const VALID_FORMAT = new Set(["mp4", "webm", "mov"]);
-const FORMAT_EXT: Record<string, string> = { mp4: ".mp4", webm: ".webm", mov: ".mov" };
+const VALID_FORMAT = new Set(["mp4", "webm", "mov", "png-sequence"]);
+// `png-sequence` writes a directory of frames rather than a single muxed file,
+// so its "extension" is empty — the auto-output path becomes a directory name.
+const FORMAT_EXT: Record<string, string> = {
+  mp4: ".mp4",
+  webm: ".webm",
+  mov: ".mov",
+  "png-sequence": "",
+};
 
 const CPU_CORE_COUNT = cpus().length;
 
 export default defineCommand({
   meta: {
     name: "render",
-    description: "Render a composition to MP4, WebM, or MOV",
+    description: "Render a composition to MP4, WebM, MOV, or a PNG sequence",
   },
   args: {
     dir: {
       type: "positional",
       description: "Project directory",
       required: false,
+    },
+    composition: {
+      type: "string",
+      alias: "c",
+      description:
+        "Render a specific composition file instead of index.html (e.g. compositions/intro.html). " +
+        "Sub-compositions using <template> wrappers must be referenced from index.html via data-composition-src.",
     },
     output: {
       type: "string",
@@ -66,7 +106,10 @@ export default defineCommand({
     },
     format: {
       type: "string",
-      description: "Output format: mp4, webm, mov (MOV/WebM render with transparency)",
+      description:
+        "Output format: mp4, webm, mov, png-sequence " +
+        "(MOV/WebM render with transparency; png-sequence writes RGBA frames " +
+        "to a directory for AE/Nuke/Fusion ingest)",
       default: "mp4",
     },
     workers: {
@@ -103,7 +146,7 @@ export default defineCommand({
     "browser-gpu": {
       type: "boolean",
       description:
-        "Use host GPU acceleration for Chrome/WebGL capture. Enabled by default for local renders; use --no-browser-gpu to opt out.",
+        "Force host GPU acceleration for Chrome/WebGL capture. Default: auto (probe on first launch; fall back to software if no GPU). Use --no-browser-gpu to force software (SwiftShader).",
     },
     quiet: {
       type: "boolean",
@@ -123,6 +166,27 @@ export default defineCommand({
     "max-concurrent-renders": {
       type: "string",
       description: "Max concurrent renders when using the producer server (1-10). Default: 2.",
+    },
+    variables: {
+      type: "string",
+      description:
+        'JSON object of variable values, merged over the composition\'s data-composition-variables defaults. Example: --variables \'{"title":"Hello"}\'. Read inside the composition via window.__hyperframes.getVariables().',
+    },
+    "variables-file": {
+      type: "string",
+      description:
+        "Path to a JSON file with variable values (alternative to --variables). The file must contain a single JSON object.",
+    },
+    "strict-variables": {
+      type: "boolean",
+      description:
+        "Fail render if any --variables key is undeclared or has a wrong type vs the composition's data-composition-variables. Without this flag, mismatches are warnings.",
+      default: false,
+    },
+    resolution: {
+      type: "string",
+      description:
+        "Output resolution preset: landscape (1920x1080), portrait (1080x1920), landscape-4k (3840x2160), portrait-4k (2160x3840). Aliases: 1080p, 4k, uhd. The composition is unchanged — Chrome renders at higher DPR (deviceScaleFactor) so the captured screenshot lands at the requested dimensions. Aspect ratio must match the composition; the scale must be an integer multiple. Not yet supported with --hdr.",
     },
   },
   async run({ args }) {
@@ -148,10 +212,35 @@ export default defineCommand({
     // ── Validate format ─────────────────────────────────────────────────
     const formatRaw = args.format ?? "mp4";
     if (!VALID_FORMAT.has(formatRaw)) {
-      errorBox("Invalid format", `Got "${formatRaw}". Must be mp4, webm, or mov.`);
+      errorBox("Invalid format", `Got "${formatRaw}". Must be mp4, webm, mov, or png-sequence.`);
       process.exit(1);
     }
-    const format = formatRaw as "mp4" | "webm" | "mov";
+    const format = formatRaw as "mp4" | "webm" | "mov" | "png-sequence";
+
+    // ── Validate resolution ────────────────────────────────────────────────
+    let outputResolution: CanvasResolution | undefined;
+    if (args.resolution !== undefined) {
+      outputResolution = normalizeResolutionFlag(args.resolution);
+      if (!outputResolution) {
+        errorBox(
+          "Invalid resolution",
+          `Got "${args.resolution}". Must be one of: landscape, portrait, landscape-4k, portrait-4k (or aliases 1080p, 4k, uhd).`,
+        );
+        process.exit(1);
+      }
+      // Reject the --resolution + --hdr combination at the CLI layer so the
+      // user sees the friendly errorBox before any work directories or
+      // ffmpeg processes spin up. The orchestrator also enforces this via
+      // resolveDeviceScaleFactor — defense in depth.
+      if (args.hdr) {
+        errorBox(
+          "Conflicting flags",
+          "--resolution cannot be combined with --hdr. The HDR pipeline composites at composition dimensions and does not yet support supersampling.",
+          "Render in two passes: HDR at composition resolution, then upscale separately with ffmpeg.",
+        );
+        process.exit(1);
+      }
+    }
 
     // ── Validate workers ──────────────────────────────────────────────────
     let workers: number | undefined;
@@ -193,7 +282,7 @@ export default defineCommand({
     const useDocker = args.docker ?? false;
     const useGpu = args.gpu ?? false;
     const browserGpuArg = args["browser-gpu"];
-    const useBrowserGpu = resolveBrowserGpuForCli(useDocker, browserGpuArg);
+    const browserGpuMode = resolveBrowserGpuForCli(useDocker, browserGpuArg);
     const quiet = args.quiet ?? false;
     const strictAll = args["strict-all"] ?? false;
     const strictErrors = (args.strict ?? false) || strictAll;
@@ -232,22 +321,55 @@ export default defineCommand({
       process.exit(1);
     }
 
+    // ── Validate composition entry file ──────────────────────────────────
+    const entryFile = args.composition?.trim().replace(/^\.\//, "") || undefined;
+    if (entryFile) {
+      const absProjectDir = resolve(project.dir);
+      const entryPath = resolve(absProjectDir, entryFile);
+      if (!entryPath.startsWith(absProjectDir)) {
+        errorBox(
+          "Invalid composition path",
+          `Entry file must stay inside the project directory: ${entryFile}`,
+        );
+        process.exit(1);
+      }
+      try {
+        statSync(entryPath);
+      } catch {
+        errorBox(
+          "Composition not found",
+          `"${entryFile}" does not exist in the project directory.`,
+          "Pass a path to a .html file relative to the project root (e.g. compositions/intro.html).",
+        );
+        process.exit(1);
+      }
+    }
+
     // ── Print render plan ─────────────────────────────────────────────────
     if (!quiet) {
       const workerLabel =
         workers != null ? `${workers} workers` : `auto workers (${CPU_CORE_COUNT} cores detected)`;
       console.log("");
+      const nameLabel = entryFile ? project.name + "/" + entryFile : project.name;
       console.log(
-        c.accent("\u25C6") +
-          "  Rendering " +
-          c.accent(project.name) +
-          c.dim(" \u2192 " + outputPath),
+        c.accent("\u25C6") + "  Rendering " + c.accent(nameLabel) + c.dim(" \u2192 " + outputPath),
       );
       console.log(c.dim("   " + fps + "fps \u00B7 " + quality + " \u00B7 " + workerLabel));
-      if (useGpu || useBrowserGpu) {
+      if (outputResolution) {
+        // Don't claim "supersampled" — when the composition is already at the
+        // target dimensions, the DPR resolves to 1 and no supersampling
+        // happens. We don't have the composition's dims at this point in the
+        // CLI, so describe the intent rather than the mechanism.
+        console.log(c.dim("   Output resolution: " + outputResolution));
+      }
+      if (useGpu || browserGpuMode !== "software") {
         const gpuModes = [
           useGpu ? "encoder GPU" : null,
-          useBrowserGpu ? "browser GPU (auto)" : null,
+          browserGpuMode === "hardware"
+            ? "browser GPU (forced)"
+            : browserGpuMode === "auto"
+              ? "browser GPU (auto-detect)"
+              : null,
         ].filter(Boolean);
         console.log(c.dim("   GPU: " + gpuModes.join(" + ")));
       }
@@ -328,6 +450,36 @@ export default defineCommand({
       process.exit(1);
     }
 
+    // ── Resolve --variables / --variables-file ──────────────────────────
+    const variables = resolveVariablesArg(args.variables, args["variables-file"]);
+
+    // ── Validate --variables against data-composition-variables ─────────
+    const strictVariables = args["strict-variables"] ?? false;
+    if (variables && Object.keys(variables).length > 0) {
+      const issues = validateVariablesAgainstProject(project.indexPath, variables);
+      if (issues.length > 0) {
+        if (!quiet) {
+          console.log("");
+          console.log(
+            c.warn(
+              `Variable ${issues.length === 1 ? "issue" : "issues"} (${issues.length}) — values may not render as expected:`,
+            ),
+          );
+          for (const issue of issues) {
+            console.log("  " + c.dim(formatVariableValidationIssue(issue)));
+          }
+          console.log("");
+        }
+        if (strictVariables) {
+          console.log(
+            c.error("  Aborting render due to variable issues (--strict-variables mode)."),
+          );
+          console.log("");
+          process.exit(1);
+        }
+      }
+    }
+
     // ── Render ────────────────────────────────────────────────────────────
     if (useDocker) {
       await renderDocker(project.dir, outputPath, {
@@ -336,11 +488,15 @@ export default defineCommand({
         format,
         workers,
         gpu: useGpu,
-        browserGpu: useBrowserGpu,
+        browserGpuMode,
         hdrMode: args.sdr ? "force-sdr" : args.hdr ? "force-hdr" : "auto",
         crf,
         videoBitrate,
         quiet,
+        variables,
+        entryFile,
+        outputResolution,
+        exitAfterComplete: true,
       });
     } else {
       await renderLocal(project.dir, outputPath, {
@@ -349,12 +505,16 @@ export default defineCommand({
         format,
         workers,
         gpu: useGpu,
-        browserGpu: useBrowserGpu,
+        browserGpuMode,
         hdrMode: args.sdr ? "force-sdr" : args.hdr ? "force-hdr" : "auto",
         crf,
         videoBitrate,
         quiet,
         browserPath,
+        variables,
+        entryFile,
+        outputResolution,
+        exitAfterComplete: true,
       });
     }
   },
@@ -363,26 +523,192 @@ export default defineCommand({
 interface RenderOptions {
   fps: 24 | 30 | 60;
   quality: "draft" | "standard" | "high";
-  format: "mp4" | "webm" | "mov";
+  format: "mp4" | "webm" | "mov" | "png-sequence";
   workers?: number;
   gpu: boolean;
-  browserGpu: boolean;
+  /**
+   * Chrome WebGL backend mode. "auto" probes on first launch and falls back
+   * to "software" if no usable GPU. Defaults to "software" when omitted to
+   * stay backwards-compatible with callers that pre-date the tri-state.
+   */
+  browserGpuMode?: "auto" | "hardware" | "software";
   hdrMode: "auto" | "force-hdr" | "force-sdr";
   crf?: number;
   videoBitrate?: string;
   quiet: boolean;
   browserPath?: string;
+  variables?: Record<string, unknown>;
+  entryFile?: string;
+  exitAfterComplete?: boolean;
+  /** Output resolution preset; see `resolveDeviceScaleFactor` for constraints. */
+  outputResolution?: CanvasResolution;
 }
 
+export type VariablesParseError =
+  | { kind: "conflict" }
+  | { kind: "read-error"; path: string; cause: string }
+  | { kind: "parse-error"; source: "inline" | "file"; cause: string }
+  | { kind: "shape-error" };
+
+export type VariablesParseResult =
+  | { ok: true; value: Record<string, unknown> | undefined }
+  | { ok: false; error: VariablesParseError };
+
+/**
+ * Pure parser for `--variables` / `--variables-file` flag pair. Splits out
+ * from `resolveVariablesArg` so validation paths are unit-testable without
+ * triggering `process.exit`. Reports failures via a structured `kind`
+ * discriminant so the side-effecting wrapper owns all UI strings.
+ */
+export function parseVariablesArg(
+  inline: string | undefined,
+  filePath: string | undefined,
+  readFile: (path: string) => string = (p) => readFileSync(resolve(p), "utf8"),
+): VariablesParseResult {
+  if (inline != null && filePath != null) {
+    return { ok: false, error: { kind: "conflict" } };
+  }
+  let raw: string | undefined;
+  let source: "inline" | "file" | undefined;
+  if (inline != null) {
+    raw = inline;
+    source = "inline";
+  } else if (filePath != null) {
+    try {
+      raw = readFile(filePath);
+      source = "file";
+    } catch (error: unknown) {
+      return {
+        ok: false,
+        error: {
+          kind: "read-error",
+          path: filePath,
+          cause: error instanceof Error ? error.message : String(error),
+        },
+      };
+    }
+  }
+  if (raw == null) return { ok: true, value: undefined };
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error: unknown) {
+    return {
+      ok: false,
+      error: {
+        kind: "parse-error",
+        source: source ?? "inline",
+        cause: error instanceof Error ? error.message : String(error),
+      },
+    };
+  }
+  if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { ok: false, error: { kind: "shape-error" } };
+  }
+  return { ok: true, value: parsed as Record<string, unknown> };
+}
+
+function variablesErrorMessage(error: VariablesParseError): { title: string; message: string } {
+  switch (error.kind) {
+    case "conflict":
+      return {
+        title: "Conflicting variables flags",
+        message: "Use either --variables or --variables-file, not both.",
+      };
+    case "read-error":
+      return {
+        title: "Could not read --variables-file",
+        message: `${error.path}: ${error.cause}`,
+      };
+    case "parse-error":
+      return {
+        title:
+          error.source === "file"
+            ? "Invalid JSON in --variables-file"
+            : "Invalid JSON in --variables",
+        message: error.cause,
+      };
+    case "shape-error":
+      return {
+        title: "Invalid variables payload",
+        message: 'Variables must be a JSON object (e.g. {"title":"Hello"}).',
+      };
+  }
+}
+
+/**
+ * Resolve `--variables` / `--variables-file` into a plain object, or
+ * `undefined` when neither flag is set. Exits the process with a friendly
+ * error box on any validation failure.
+ */
+export function resolveVariablesArg(
+  inline: string | undefined,
+  filePath: string | undefined,
+): Record<string, unknown> | undefined {
+  const result = parseVariablesArg(inline, filePath);
+  if (!result.ok) {
+    const { title, message } = variablesErrorMessage(result.error);
+    errorBox(title, message);
+    process.exit(1);
+  }
+  return result.value;
+}
+
+/**
+ * Validate `--variables` values against the project's top-level
+ * `data-composition-variables` declarations. Returns an empty array when
+ * the index has no declarations or when every key is declared with a
+ * matching type. Errors reading the index are silently treated as "no
+ * declarations" — the lint pass owns malformed-HTML diagnostics, render
+ * shouldn't fail just because the schema is unreadable.
+ */
+export function validateVariablesAgainstProject(
+  indexPath: string,
+  values: Record<string, unknown>,
+): VariableValidationIssue[] {
+  let html: string;
+  try {
+    html = readFileSync(indexPath, "utf8");
+  } catch {
+    return [];
+  }
+  // extractCompositionMetadata uses DOMParser, which Node doesn't ship.
+  // Same pattern as `compositions.ts` and other CLI commands that touch
+  // @hyperframes/core's HTML parsers.
+  ensureDOMParser();
+  const meta = extractCompositionMetadata(html);
+  if (meta.variables.length === 0) return [];
+  return validateVariables(values, meta.variables);
+}
+
+/**
+ * Resolve the browser-GPU mode for a CLI render invocation.
+ *
+ * Priority (highest first):
+ *   1. Docker mode → always "software" (docker has no portable GPU
+ *      passthrough; the engine's render path uses SwiftShader).
+ *   2. Explicit CLI flag — `--browser-gpu` → "hardware",
+ *      `--no-browser-gpu` → "software".
+ *   3. Env var `PRODUCER_BROWSER_GPU_MODE` accepts "hardware" / "software" /
+ *      "auto".
+ *   4. Default = "auto" — engine probes WebGL availability on first launch
+ *      and falls back to software if the host lacks a usable GPU.
+ *
+ * Returning "auto" by default lets local renders Just Work whether or not the
+ * host has a GPU, while preserving the explicit overrides for CI / power
+ * users who want failure-on-misconfig.
+ */
 export function resolveBrowserGpuForCli(
   useDocker: boolean,
   browserGpuArg: boolean | undefined,
   envMode = process.env.PRODUCER_BROWSER_GPU_MODE,
-): boolean {
-  if (useDocker) return false;
-  if (browserGpuArg !== undefined) return browserGpuArg;
-  if (envMode === "software") return false;
-  return true;
+): "auto" | "hardware" | "software" {
+  if (useDocker) return "software";
+  if (browserGpuArg === true) return "hardware";
+  if (browserGpuArg === false) return "software";
+  if (envMode === "hardware" || envMode === "software" || envMode === "auto") return envMode;
+  return "auto";
 }
 
 const DOCKER_IMAGE_PREFIX = "hyperframes-renderer";
@@ -502,11 +828,14 @@ async function renderDocker(
       format: options.format,
       workers: options.workers,
       gpu: options.gpu,
-      browserGpu: options.browserGpu,
+      browserGpu: options.browserGpuMode === "hardware",
       hdrMode: options.hdrMode,
       crf: options.crf,
       videoBitrate: options.videoBitrate,
       quiet: options.quiet,
+      variables: options.variables,
+      entryFile: options.entryFile,
+      outputResolution: options.outputResolution,
     },
   });
 
@@ -545,6 +874,7 @@ async function renderDocker(
   });
 
   printRenderComplete(outputPath, elapsed, options.quiet);
+  if (options.exitAfterComplete) scheduleRenderProcessExit();
 }
 
 export async function renderLocal(
@@ -570,11 +900,14 @@ export async function renderLocal(
     workers: options.workers,
     useGpu: options.gpu,
     producerConfig: producer.resolveConfig({
-      browserGpuMode: options.browserGpu ? "hardware" : "software",
+      browserGpuMode: options.browserGpuMode ?? "software",
     }),
     hdrMode: options.hdrMode,
     crf: options.crf,
     videoBitrate: options.videoBitrate,
+    variables: options.variables,
+    entryFile: options.entryFile,
+    outputResolution: options.outputResolution,
   });
 
   const onProgress = options.quiet
@@ -592,6 +925,27 @@ export async function renderLocal(
   const elapsed = Date.now() - startTime;
   trackRenderMetrics(job, elapsed, options, false);
   printRenderComplete(outputPath, elapsed, options.quiet);
+  if (options.exitAfterComplete) scheduleRenderProcessExit();
+}
+
+type UnrefableTimer = {
+  unref: () => void;
+};
+
+function isUnrefableTimer(
+  timer: ReturnType<typeof setTimeout>,
+): timer is ReturnType<typeof setTimeout> & UnrefableTimer {
+  return (
+    typeof timer === "object" &&
+    timer !== null &&
+    "unref" in timer &&
+    typeof timer.unref === "function"
+  );
+}
+
+function scheduleRenderProcessExit(): void {
+  const timer = setTimeout(() => process.exit(0), 100);
+  if (isUnrefableTimer(timer)) timer.unref();
 }
 
 function getMemorySnapshot() {
@@ -685,7 +1039,24 @@ function printRenderComplete(outputPath: string, elapsedMs: number, quiet: boole
 
   let fileSize = "unknown";
   try {
-    fileSize = formatBytes(statSync(outputPath).size);
+    const stat = statSync(outputPath);
+    if (stat.isDirectory()) {
+      // png-sequence output is a directory; sum the contained file sizes so
+      // the user sees the on-disk footprint of the deliverable rather than
+      // the platform-specific size of the directory inode itself.
+      let total = 0;
+      for (const entry of readdirSync(outputPath, { withFileTypes: true })) {
+        if (!entry.isFile()) continue;
+        try {
+          total += statSync(join(outputPath, entry.name)).size;
+        } catch {
+          // skip unreadable entries
+        }
+      }
+      fileSize = formatBytes(total);
+    } else {
+      fileSize = formatBytes(stat.size);
+    }
   } catch {
     // file doesn't exist or is inaccessible
   }

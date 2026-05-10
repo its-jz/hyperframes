@@ -1,3 +1,5 @@
+import type { CanvasResolution } from "../core.types.js";
+
 /** Resolved info about a single project. */
 export interface ResolvedProject {
   id: string;
@@ -41,6 +43,9 @@ export interface StudioApiAdapter {
   /** Bundle a project directory into a single HTML string. Returns null if unavailable. */
   bundle(projectDir: string): Promise<string | null>;
 
+  /** Optional: cached signature for project files that should invalidate preview frame caches. */
+  getProjectSignature?: (projectDir: string) => string;
+
   /** Lint a single HTML string. */
   lint(html: string, opts?: { filePath?: string }): Promise<LintResult> | LintResult;
 
@@ -61,6 +66,11 @@ export interface StudioApiAdapter {
     fps: number;
     quality: string;
     jobId: string;
+    /**
+     * Optional output resolution preset. See `resolveDeviceScaleFactor` in
+     * the producer for the integer-scale + aspect + HDR constraints.
+     */
+    outputResolution?: CanvasResolution;
   }): RenderJobState;
 
   /** Optional: generate a JPEG thumbnail via Puppeteer or similar. */

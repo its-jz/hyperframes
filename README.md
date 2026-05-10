@@ -17,7 +17,7 @@
 <p align="center"><b>Write HTML. Render video. Built for agents.</b></p>
 
 <p align="center">
-  <img src="https://static.heygen.ai/hyperframes-oss/docs/images/readme-demo.gif" alt="HyperFrames demo — HTML code on the left transforms into a rendered video on the right" width="800">
+  <img src="https://static.heygen.ai/hyperframes-oss/docs/images/hfgif-1280.webp" alt="HyperFrames demo — HTML code on the left transforms into a rendered video on the right" width="800">
 </p>
 
 Hyperframes is an open-source video rendering framework that lets you create, preview, and render HTML-based video compositions — with first-class support for AI agents.
@@ -32,7 +32,7 @@ Install the HyperFrames skills, then describe the video you want:
 npx skills add heygen-com/hyperframes
 ```
 
-This teaches your agent (Claude Code, Cursor, Gemini CLI, Codex) how to write correct compositions, GSAP timelines, Tailwind v4 browser-runtime styles, and first-party adapter animations. In Claude Code, the skills register as slash commands — invoke `/hyperframes` to author compositions, `/hyperframes-cli` for CLI commands, `/tailwind` for `init --tailwind` projects, `/gsap` for timeline animation help, or the adapter skills (`/animejs`, `/css-animations`, `/lottie`, `/three`, `/waapi`) when a composition uses those runtimes.
+This teaches your agent (Claude Code, Cursor, Gemini CLI, Codex) how to write correct compositions, GSAP timelines, Tailwind v4 browser-runtime styles, and first-party adapter animations. In Claude Code, the skills register as slash commands — invoke `/hyperframes` to author compositions, `/hyperframes-cli` for the dev-loop commands (init, lint, preview, render), `/hyperframes-media` for asset preprocessing (TTS, transcription, background removal), `/tailwind` for `init --tailwind` projects, `/gsap` for timeline animation help, or the adapter skills (`/animejs`, `/css-animations`, `/lottie`, `/three`, `/waapi`) when a composition uses those runtimes.
 
 For Claude Design, open [`docs/guides/claude-design-hyperframes.md`](https://github.com/heygen-com/hyperframes/blob/main/docs/guides/claude-design-hyperframes.md) on GitHub and click the download button (↓) to save it, then attach the file to your Claude Design chat. It produces a valid first draft; refine in any AI coding agent. See the [Claude Design guide](https://hyperframes.heygen.com/guides/claude-design).
 
@@ -188,7 +188,8 @@ npx skills add heygen-com/hyperframes
 | Skill                     | What it teaches                                                                                                     |
 | ------------------------- | ------------------------------------------------------------------------------------------------------------------- |
 | `hyperframes`             | HTML composition authoring, captions, TTS, audio-reactive animation, transitions                                    |
-| `hyperframes-cli`         | CLI commands: init, lint, preview, render, transcribe, tts, doctor                                                  |
+| `hyperframes-cli`         | Dev-loop CLI: init, lint, inspect, preview, render, doctor                                                          |
+| `hyperframes-media`       | Asset preprocessing: tts (Kokoro), transcribe (Whisper), remove-background (u2net) — voice/model/codec selection    |
 | `hyperframes-registry`    | Block and component installation via `hyperframes add`                                                              |
 | `website-to-hyperframes`  | Capture a URL and turn it into a video — full website-to-video pipeline                                             |
 | `remotion-to-hyperframes` | Translate a Remotion (React) composition into a HyperFrames HTML composition                                        |

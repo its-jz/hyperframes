@@ -18,6 +18,7 @@ import {
   releaseBrowser,
   forceReleaseBrowser,
   buildChromeArgs,
+  resolveBrowserGpuMode,
   resolveHeadlessShellPath,
   type CaptureMode,
 } from "./browserManager.js";
@@ -113,11 +114,22 @@ export async function createCaptureSession(
   const headlessShell = resolveHeadlessShellPath(config);
   const isLinux = process.platform === "linux";
   const forceScreenshot = config?.forceScreenshot ?? DEFAULT_CONFIG.forceScreenshot;
+  // BeginFrame's screenshot does not honor a viewport `deviceScaleFactor`
+  // (the captured surface is sized by the OS window in CSS pixels regardless
+  // of `Emulation.setDeviceMetricsOverride`'s DPR). When supersampling we
+  // need explicit clip+scale on `Page.captureScreenshot`, so fall back to
+  // the screenshot path for any DPR > 1.
+  const supersampling = (options.deviceScaleFactor ?? 1) > 1;
   const preMode: CaptureMode =
-    headlessShell && isLinux && !forceScreenshot ? "beginframe" : "screenshot";
+    headlessShell && isLinux && !forceScreenshot && !supersampling ? "beginframe" : "screenshot";
+  const requestedGpuMode = config?.browserGpuMode ?? DEFAULT_CONFIG.browserGpuMode;
+  const resolvedGpuMode = await resolveBrowserGpuMode(requestedGpuMode, {
+    chromePath: headlessShell ?? undefined,
+    browserTimeout: config?.browserTimeout,
+  });
   const chromeArgs = buildChromeArgs(
     { width: options.width, height: options.height, captureMode: preMode },
-    config,
+    { ...config, browserGpuMode: resolvedGpuMode },
   );
 
   const { browser, captureMode } = await acquireBrowser(chromeArgs, config);
@@ -155,6 +167,22 @@ export async function createCaptureSession(
       w.__name = <T>(fn: T, _name: string): T => fn;
     }
   });
+  // Inject render-time variable overrides before any page script runs, so the
+  // runtime helper `getVariables()` returns the merged result on its first
+  // call. Pass the JSON string and parse inside the page so we don't require
+  // any JSON-incompatible value to round-trip through Puppeteer's serializer.
+  if (options.variables && Object.keys(options.variables).length > 0) {
+    const variablesJson = JSON.stringify(options.variables);
+    await page.evaluateOnNewDocument((json: string) => {
+      type WindowWithVariables = Window & { __hfVariables?: Record<string, unknown> };
+      try {
+        (window as WindowWithVariables).__hfVariables = JSON.parse(json);
+      } catch {
+        // The CLI validated the JSON before this point — a parse failure here
+        // means the page swapped JSON.parse, which is the page's problem.
+      }
+    }, variablesJson);
+  }
   const browserVersion = await browser.version();
   const expectedMajor = config?.expectedChromiumMajor;
   if (Number.isFinite(expectedMajor)) {
@@ -372,8 +400,14 @@ export async function initializeSession(session: CaptureSession): Promise<void> 
 
     await applyVideoMetadataHints(page, session.options.videoMetadataHints);
 
-    // Wait for all video elements to have loaded metadata (dimensions + duration)
-    // Without this, frame 0 captures videos at their 300x150 default size.
+    // Wait for all video elements to have decoded their CURRENT frame, not
+    // just metadata. readyState >= 2 (HAVE_CURRENT_DATA) means a frame is
+    // actually rasterized and ready to paint — at >= 1 (HAVE_METADATA) we
+    // only know the dimensions, and the first <video> screenshot can come
+    // back as a black/blank rectangle. This bites compositions with two
+    // <video> elements of different codecs (h264 mp4 + VP9 webm) where the
+    // faster decoder lets the readiness check pass while the slower one
+    // hasn't painted, producing a black "first frame" for the slower clip.
     // skipReadinessVideoIds excludes natively-extracted videos (e.g. HDR HEVC
     // sources) whose frames come from ffmpeg out-of-band. videoMetadataHints
     // supply intrinsic dimensions for skipped videos whose layout depends on
@@ -381,12 +415,12 @@ export async function initializeSession(session: CaptureSession): Promise<void> 
     const skipIdsLiteral = JSON.stringify(session.options.skipReadinessVideoIds ?? []);
     const videosReady = await pollPageExpression(
       page,
-      `(() => { const skip = new Set(${skipIdsLiteral}); const vids = Array.from(document.querySelectorAll("video")).filter(v => !skip.has(v.id)); return vids.length === 0 || vids.every(v => v.readyState >= 1); })()`,
+      `(() => { const skip = new Set(${skipIdsLiteral}); const vids = Array.from(document.querySelectorAll("video")).filter(v => !skip.has(v.id)); return vids.length === 0 || vids.every(v => v.readyState >= 2); })()`,
       pageReadyTimeout,
     );
     if (!videosReady) {
       throw new Error(
-        `[FrameCapture] video metadata not ready after ${pageReadyTimeout}ms. Video elements must load metadata before capture starts.`,
+        `[FrameCapture] video first frame not decoded after ${pageReadyTimeout}ms. Video elements must reach readyState >= 2 (HAVE_CURRENT_DATA) before capture starts.`,
       );
     }
 
@@ -468,16 +502,13 @@ export async function initializeSession(session: CaptureSession): Promise<void> 
 
   await applyVideoMetadataHints(page, session.options.videoMetadataHints);
 
-  // Wait for all video elements to have loaded metadata (dimensions + duration).
-  // Without this, frame 0 captures videos at their 300x150 default size.
-  // See screenshot-mode comment above for why skipReadinessVideoIds and
-  // videoMetadataHints are paired.
+  // Same readyState contract as the screenshot path above (>= 2 / HAVE_CURRENT_DATA).
   const beginframeSkipIdsLiteral = JSON.stringify(session.options.skipReadinessVideoIds ?? []);
   const videoDeadline =
     Date.now() + (session.config?.playerReadyTimeout ?? DEFAULT_CONFIG.playerReadyTimeout);
   while (Date.now() < videoDeadline) {
     const videosReady = await page.evaluate(
-      `(() => { const skip = new Set(${beginframeSkipIdsLiteral}); const vids = Array.from(document.querySelectorAll("video")).filter(v => !skip.has(v.id)); return vids.length === 0 || vids.every(v => v.readyState >= 1); })()`,
+      `(() => { const skip = new Set(${beginframeSkipIdsLiteral}); const vids = Array.from(document.querySelectorAll("video")).filter(v => !skip.has(v.id)); return vids.length === 0 || vids.every(v => v.readyState >= 2); })()`,
     );
     if (videosReady) break;
     await new Promise((r) => setTimeout(r, 100));
