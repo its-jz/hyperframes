@@ -9,7 +9,7 @@
 import { describe, it, expect } from "vitest";
 import { parseMutable, getElementStyles, setElementStyles } from "./model.js";
 import { applyOp, validateOp } from "./mutate.js";
-import { applyPatchesToDocument } from "./apply-patches.js";
+import { applyPatchesToDocument, applyOverrideSet } from "./apply-patches.js";
 import { pathToKey } from "./patches.js";
 import { serializeDocument } from "./serialize.js";
 
@@ -603,6 +603,54 @@ describe("addElement", () => {
     });
     expect(r.ok).toBe(true);
   });
+
+  // The dispatch path runs applyOp WITHOUT validateOp, so the handler must
+  // re-enforce these guards itself (return EMPTY) rather than crash or insert.
+  it.each([
+    { name: "unknown parent id (no crash)", parent: "hf-does-not-exist", html: "<div>x</div>" },
+    {
+      name: "fragment with <script> (never inserts raw markup)",
+      parent: "hf-stage",
+      html: "<div><scr" + "ipt>alert(1)</scr" + "ipt></div>",
+    },
+    {
+      name: "multi-root fragment (no silent drop of extra roots)",
+      parent: "hf-stage",
+      html: "<p>a</p><p>b</p>",
+    },
+  ])("handler guard: $name → no-op", ({ parent, html }) => {
+    const result = applyOp(fresh(), { type: "addElement", parent, index: 0, html });
+    expect(result.forward).toHaveLength(0);
+    expect(result.meta?.newId).toBeUndefined();
+  });
+
+  // Regression: a scoped sub-comp parent ("hf-host/hf-leaf") whose bare leaf id
+  // also exists at top level. The forward patch must keep the scoped path so
+  // redo/replay re-inserts under the SAME parent (resolveScoped), not the
+  // canonical top-level dup.
+  it("scoped parent: forward patch keeps the scoped path so redo targets the right parent", () => {
+    const parsed = parseMutable(
+      '<div data-hf-id="hf-stage" data-hf-root style="width:100px;height:100px">' +
+        '<div data-hf-id="hf-host"><p data-hf-id="hf-leaf">in host</p></div>' +
+        '<p data-hf-id="hf-leaf">top-level dup</p>' +
+        "</div>",
+    );
+    const result = applyOp(parsed, {
+      type: "addElement",
+      parent: "hf-host/hf-leaf",
+      index: 0,
+      html: '<span class="ins">x</span>',
+    });
+    expect((result.forward[0]!.value as { parentId: string }).parentId).toBe("hf-host/hf-leaf");
+    const newId = result.meta!.newId!;
+    // undo, then redo: the element must return under the HOST's leaf, not the dup.
+    applyPatchesToDocument(parsed, result.inverse);
+    applyPatchesToDocument(parsed, result.forward);
+    const host = parsed.document.querySelector('[data-hf-id="hf-host"]');
+    const inserted = parsed.document.querySelector(`[data-hf-id="${newId}"]`);
+    expect(inserted).not.toBeNull();
+    expect(host?.contains(inserted as Node)).toBe(true);
+  });
 });
 
 // ─── setElementStyles (model helper) ──────────────────────────────────────────
@@ -783,6 +831,41 @@ describe("setVariableValue", () => {
       name: "Roboto",
       source: "https://fonts.googleapis.com/css2?family=Roboto",
     });
+  });
+
+  // Regression: a variable declared WITHOUT a `default` key. The forward set adds
+  // the default; undo must DELETE it (restore the no-default state), not strand
+  // the set value (apply-patches previously no-op'd the remove).
+  it("B1: undo of a set on a default-less variable restores the no-default state", () => {
+    const html = `<!DOCTYPE html><html data-composition-id="c1" data-composition-duration="5" data-composition-variables='${JSON.stringify(
+      [{ id: "brand-x", type: "color", label: "X" }],
+    )}'><body><div data-hf-id="hf-stage" data-hf-root style="width: 1280px; height: 720px" data-duration="5"></div></body></html>`;
+    const parsed = parseMutable(html);
+    const before = serializeDocument(parsed);
+    const result = applyOp(parsed, { type: "setVariableValue", id: "brand-x", value: "#ff0000" });
+    expect(readVarDefault(parsed, "brand-x")).toBe("#ff0000");
+    applyPatchesToDocument(parsed, result.inverse);
+    expect(readVarDefault(parsed, "brand-x")).toBeUndefined();
+    expect(serializeDocument(parsed)).toBe(before);
+  });
+
+  // #9: a legacy override set (only the `var.{id}` key, no paired style key, as
+  // written before the model/CSS split) must still restore the --{id} CSS prop
+  // on replay so `var(--{id})` bindings rehydrate. Object values write no CSS.
+  it("B1: applyOverrideSet derives the --{id} CSS prop from a var.{id}-only override", () => {
+    const parsed = freshWithVars();
+    applyOverrideSet(parsed, { "var.brand-color-primary": "#ff0000" });
+    expect(readVarDefault(parsed, "brand-color-primary")).toBe("#ff0000");
+    const root = parsed.document.querySelector("[data-hf-root]");
+    expect(root?.getAttribute("style")).toContain("--brand-color-primary: #ff0000");
+  });
+
+  it("B2: applyOverrideSet writes NO CSS prop for an object (font) override", () => {
+    const parsed = freshWithVars();
+    applyOverrideSet(parsed, { "var.brand-font": { name: "Roboto", source: "x" } });
+    expect(readVarDefault(parsed, "brand-font")).toEqual({ name: "Roboto", source: "x" });
+    const root = parsed.document.querySelector("[data-hf-root]");
+    expect(root?.getAttribute("style") ?? "").not.toContain("--brand-font");
   });
 });
 

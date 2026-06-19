@@ -50,7 +50,7 @@ import {
   patchRemove,
 } from "./patches.js";
 import { upsertCssRule } from "./cssWriter.js";
-import { mintHfId } from "@hyperframes/core/hf-ids";
+import { mintHfId, EXCLUDED_TAGS } from "@hyperframes/core/hf-ids";
 import { parseGsapScriptAcornForWrite } from "@hyperframes/core/gsap-parser-acorn";
 import type { GsapAnimation } from "@hyperframes/core/gsap-parser";
 import {
@@ -75,6 +75,7 @@ import {
   unrollDynamicAnimations,
 } from "@hyperframes/core/gsap-writer-acorn";
 import { deriveKeyframeBackfillDefaults } from "./keyframeBackfill.js";
+import { readVariableDefault, writeVariableDefault } from "./variableModel.js";
 
 export interface MutationResult {
   forward: JsonPatchOp[];
@@ -638,17 +639,6 @@ function handleRemoveElement(parsed: ParsedDocument, ids: HfId[]): MutationResul
 
 // ─── addElement handler ───────────────────────────────────────────────────────
 
-// Tags that must never receive a stable hf-id — mirrors hfIds.ts EXCLUDED_TAGS.
-const HF_EXCLUDED_TAGS = new Set([
-  "script",
-  "style",
-  "template",
-  "meta",
-  "link",
-  "noscript",
-  "base",
-]);
-
 /**
  * Resolve all existing hf-ids in the document into `assigned` so that
  * mintHfId cannot issue an id that already exists in the composition.
@@ -668,11 +658,11 @@ function collectDocumentHfIds(document: Document): Set<string> {
  * Returns the minted id of `root` (or its existing id if already stamped).
  */
 function mintFragmentIds(root: Element, assigned: Set<string>): string {
-  if (!root.getAttribute("data-hf-id") && !HF_EXCLUDED_TAGS.has(root.tagName.toLowerCase())) {
+  if (!root.getAttribute("data-hf-id") && !EXCLUDED_TAGS.has(root.tagName.toLowerCase())) {
     root.setAttribute("data-hf-id", mintHfId(root, assigned));
   }
   for (const el of Array.from(root.querySelectorAll("*"))) {
-    if (HF_EXCLUDED_TAGS.has(el.tagName.toLowerCase())) continue;
+    if (EXCLUDED_TAGS.has(el.tagName.toLowerCase())) continue;
     if (el.getAttribute("data-hf-id")) continue; // pinned
     el.setAttribute("data-hf-id", mintHfId(el, assigned));
   }
@@ -688,23 +678,37 @@ function mintFragmentIds(root: Element, assigned: Set<string>): string {
  * Inverse = patchRemove of the new element's path; mirrors handleRemoveElement's
  * inverse = patchAdd. Forward/inverse are thus symmetric with that handler.
  */
+/**
+ * Parse an HTML fragment in the target document and return its single root
+ * element, or null when it is empty, multi-root, or contains a <script>.
+ * The dispatch path skips validateOp, so these guards are re-enforced here:
+ * never insert raw <script>, never silently drop extra roots.
+ */
+function parseInsertableFragment(document: Document, html: string): Element | null {
+  // Same temp-div approach as apply-patches.ts to avoid cross-document issues.
+  const tmp = document.createElement("div");
+  tmp.innerHTML = html;
+  if (tmp.querySelector("script")) return null;
+  const node = tmp.firstElementChild;
+  if (!node || node.nextElementSibling) return null;
+  return node;
+}
+
 function handleAddElement(
   parsed: ParsedDocument,
   parent: HfId | null,
   index: number,
   html: string,
 ): MutationResult {
-  // Resolve parent element (null → document body).
+  // Resolve parent element (null → document body). Narrow rather than assert:
+  // _dispatch does not run validateOp, so a bad parent id must not crash here.
   const parentEl =
     parent === null
-      ? ((parsed.document as unknown as { body: Element }).body as unknown as Element)
-      : (resolveScoped(parsed.document, parent) as Element);
+      ? ((parsed.document as Document & { body?: Element | null }).body ?? null)
+      : resolveScoped(parsed.document, parent);
+  if (!parentEl) return EMPTY;
 
-  // Parse the fragment within the target document to avoid cross-document issues
-  // (same approach as apply-patches.ts:222). validateOp guarantees a non-null firstElementChild.
-  const tmp = parsed.document.createElement("div");
-  tmp.innerHTML = html;
-  const node = tmp.firstElementChild;
+  const node = parseInsertableFragment(parsed.document, html);
   if (!node) return EMPTY;
 
   // Mint ids against the LIVE doc's existing id set (the #1 landmine — a fresh
@@ -718,8 +722,11 @@ function handleAddElement(
   const ref = Array.from(parentEl.children)[index] ?? null;
   parentEl.insertBefore(node, ref);
 
-  // parentId for the inverse patch: bare id of the parent, or null for body root.
-  const parentId = parent !== null ? (parentEl.getAttribute("data-hf-id") ?? null) : null;
+  // parentId for the inverse/replay patch: preserve the caller's id verbatim
+  // (scoped "hf-host/hf-leaf" path or composition id), not the bare data-hf-id —
+  // apply-patches resolves it via findById→resolveScoped, so dropping the host
+  // prefix would re-insert under the wrong (canonical) parent on redo/replay.
+  const parentId = parent;
 
   const path = elementPath(newId);
   return {
@@ -800,59 +807,9 @@ function handleSetCompositionMetadata(
 }
 
 // ─── Variable JSON model helpers ─────────────────────────────────────────────
-
-type VariableDecl = { id: string; default: unknown; [key: string]: unknown };
-
-/**
- * Read the current `default` value for a variable id from
- * `document.documentElement`'s `data-composition-variables` attribute.
- * Returns undefined when the attribute is absent, the JSON is invalid,
- * or no entry matches the given id.
- */
-function readVariableDefault(document: Document, id: string): unknown {
-  const htmlEl = (document as Document & { documentElement?: Element }).documentElement;
-  if (!htmlEl) return undefined;
-  const raw = htmlEl.getAttribute("data-composition-variables");
-  if (!raw) return undefined;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    return undefined;
-  }
-  if (!Array.isArray(parsed)) return undefined;
-  const entry = (parsed as unknown[]).find(
-    (v): v is VariableDecl => typeof v === "object" && v !== null && (v as VariableDecl).id === id,
-  );
-  return entry?.default;
-}
-
-/**
- * Upsert a variable's `default` in `data-composition-variables` on
- * `document.documentElement`. No-ops when the attribute is absent or
- * contains no declaration for the given id (we never auto-add declarations
- * for undeclared variables — keep the schema authoritative).
- * Returns true when the attribute was updated.
- */
-function writeVariableDefault(document: Document, id: string, newDefault: unknown): boolean {
-  const htmlEl = (document as Document & { documentElement?: Element }).documentElement;
-  if (!htmlEl) return false;
-  const raw = htmlEl.getAttribute("data-composition-variables");
-  if (!raw) return false;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    return false;
-  }
-  if (!Array.isArray(parsed)) return false;
-  const arr = parsed as VariableDecl[];
-  const idx = arr.findIndex((v) => typeof v === "object" && v !== null && v.id === id);
-  if (idx < 0) return false; // variable not declared — don't auto-add
-  arr[idx] = { ...arr[idx]!, default: newDefault };
-  htmlEl.setAttribute("data-composition-variables", JSON.stringify(arr));
-  return true;
-}
+// readVariableDefault / writeVariableDefault now live in ./variableModel.ts,
+// shared with the patch-replay path (apply-patches.ts) so the model shape can't
+// diverge between forward mutation and replay.
 
 /**
  * True when the value is a FontValue or ImageValue object
@@ -861,7 +818,7 @@ function writeVariableDefault(document: Document, id: string, newDefault: unknow
 function isObjectVariableValue(
   value: string | number | boolean | FontValue | ImageValue,
 ): value is FontValue | ImageValue {
-  return typeof value === "object" && value !== null;
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function handleSetVariableValue(
@@ -964,6 +921,9 @@ function handleAddWithKeyframes(
 ): MutationResult {
   const script = getGsapScript(parsed.document);
   if (!script) throw new Error("No GSAP script block found in the composition.");
+  // Dispatch skips validateOp — re-enforce the empty-keyframes guard here so we
+  // never emit a degenerate `keyframes: {}` tween.
+  if (op.keyframes.length === 0) return EMPTY;
   const { script: newScript, id: animationId } = addAnimationWithKeyframesToScript(
     script,
     op.targetSelector,
@@ -983,10 +943,21 @@ function handleReplaceWithKeyframes(
 ): MutationResult {
   const script = getGsapScript(parsed.document);
   if (!script) throw new Error("No GSAP script block found in the composition.");
+  if (op.keyframes.length === 0) return EMPTY;
+  // #11: tween IDs are position-derived and re-point after any structural edit,
+  // so a stale `animationId` can resolve to a DIFFERENT tween. Require the
+  // located animation to still target the selector the caller expects; if it is
+  // absent or now points at another element, bail rather than silently replace
+  // the wrong tween. (validateOp's gsapAnimationMissing only catches absent ids.)
+  const located = locateGsapAnimation(parsed, op.animationId);
+  if (!located || located.animation.targetSelector !== op.targetSelector) return EMPTY;
   // Step 1: remove the existing tween. Position-derived IDs renumber, so the
   // inverse patch restores the full GSAP script rather than trying to re-insert
   // by ID (handled by the coarse gsapScriptChange patch pair).
   const afterRemove = removeAnimationFromScript(script, op.animationId);
+  // Defense in depth: if the id resolved to nothing the script is unchanged —
+  // bail rather than degrade the replace into a plain add (duplicate tween).
+  if (afterRemove === script) return EMPTY;
   // Step 2: insert the replacement keyframed tween.
   const { script: newScript, id: animationId } = addAnimationWithKeyframesToScript(
     afterRemove,
