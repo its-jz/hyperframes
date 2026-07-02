@@ -5,7 +5,7 @@
  * Auto-detects optimal worker count based on CPU/memory.
  */
 
-import { cpus, freemem, totalmem } from "os";
+import { cpus, freemem } from "os";
 import { existsSync, mkdirSync, readdirSync } from "fs";
 import { copyFile, rename } from "fs/promises";
 import { join } from "path";
@@ -23,12 +23,25 @@ import {
   type BeforeCaptureHook,
 } from "./frameCapture.js";
 import { DEFAULT_CONFIG, type EngineConfig } from "../config.js";
+import { assertSwiftShader } from "../utils/assertSwiftShader.js";
+import { readWebGlVendorInfoFromCanvas } from "../utils/readWebGlVendorInfoFromCanvas.js";
+import { resolveHeadlessShellPath } from "./browserManager.js";
+import { getSystemTotalMb } from "./systemMemory.js";
 
 export interface WorkerTask {
   workerId: number;
   startFrame: number;
   endFrame: number;
   outputDir: string;
+  /**
+   * Offset subtracted from the absolute frame index when naming the captured
+   * file (`frame_<i - outputFrameOffset>.{ext}`). Default 0. Distributed
+   * chunks set this to the chunk's absolute startFrame so file names land
+   * 0-indexed within the chunk's range — the encoder reads frames
+   * sequentially without an `-start_number` override. The per-frame TIME
+   * calculation still uses the absolute frame index.
+   */
+  outputFrameOffset?: number;
 }
 
 export interface WorkerResult {
@@ -39,6 +52,7 @@ export interface WorkerResult {
   durationMs: number;
   perf?: CapturePerfSummary;
   error?: string;
+  diagnostics?: string[];
 }
 
 export interface ParallelProgress {
@@ -62,11 +76,76 @@ export interface WorkerSizingConfig extends Partial<
   captureCostMultiplier?: number;
 }
 
+type WorkerBrowserPoolDecision = {
+  parallel?: boolean;
+  platform: NodeJS.Platform;
+  // Deliberately accepted but not used: forceScreenshot is not an exclusion.
+  forceScreenshot?: boolean;
+  deviceScaleFactor?: number;
+  headlessShellPath?: string;
+};
+
 const MEMORY_PER_WORKER_MB = 256;
 const MIN_WORKERS = 1;
-const ABSOLUTE_MAX_WORKERS = 10;
-const DEFAULT_SAFE_MAX_WORKERS = 6;
+const MAX_WORKER_DIAGNOSTIC_LINES = 8;
+// Hard ceiling on explicit `--workers N` requests. Above this, the cost of
+// CDP-protocol dispatch through Node's main event loop and OS scheduling
+// noise overwhelms any further parallelism. Bumped from 10 → 24 in hf#732
+// follow-up so high-core hosts (32-96+ cores) can actually surface the
+// hardware to renders that are CPU-bound on DOM capture.
+const ABSOLUTE_MAX_WORKERS = 24;
+// `auto` concurrency picks this many workers as the upper bound. Bumped
+// from a hardcoded 6 → CPU-scaled value (floor(cpuCount/8), floor at 6,
+// ceiling at 16) in hf#732 follow-up. Rationale: the prior fixed cap of 6
+// left ~90 cores idle on the validation host and forced users to pass
+// `--workers N` to opt in. Now `auto` matches what a thoughtful operator
+// would pick by hand. The /8 divisor leaves headroom for each Chrome
+// worker's SwiftShader compositor + the shader-blend thread pool, both of
+// which are themselves CPU-heavy.
+function defaultSafeMaxWorkers(): number {
+  return Math.max(6, Math.min(16, Math.floor(cpus().length / 8)));
+}
 const MIN_FRAMES_PER_WORKER = 30;
+
+// Linux/headless parallel workers need isolated browser processes: BeginFrame
+// crashes when shared, while forceScreenshot is safe but serializes
+// Page.captureScreenshot per browser. Supersampling keeps the existing path
+// until browser-pool compatibility is keyed by DPR.
+export function shouldDisableBrowserPoolForParallelWorker({
+  parallel,
+  platform,
+  deviceScaleFactor,
+  headlessShellPath,
+}: WorkerBrowserPoolDecision): boolean {
+  return Boolean(
+    parallel && platform === "linux" && headlessShellPath && (deviceScaleFactor ?? 1) <= 1,
+  );
+}
+
+export function selectWorkerDiagnostics(
+  lines: readonly string[],
+  maxLines: number = MAX_WORKER_DIAGNOSTIC_LINES,
+): string[] {
+  return lines
+    .filter((line) =>
+      /\[(FrameCapture:ERROR|Browser:ERROR|Browser:PAGEERROR|Browser:REQUESTFAILED|Browser:HTTP\d{3})\]/.test(
+        line,
+      ),
+    )
+    .slice(-maxLines);
+}
+
+function compactDiagnosticLine(line: string): string {
+  return line.replace(/\s+/g, " ").trim();
+}
+
+export function formatWorkerFailure(result: WorkerResult): string {
+  const base = `Worker ${result.workerId}: ${result.error ?? "unknown error"}`;
+  if (!result.diagnostics || result.diagnostics.length === 0) return base;
+
+  const diagnostics = result.diagnostics.map(compactDiagnosticLine).join(" | ");
+  return `${base}; diagnostics: ${diagnostics}`;
+}
 
 export function calculateOptimalWorkers(
   totalFrames: number,
@@ -79,7 +158,7 @@ export function calculateOptimalWorkers(
     if (concurrency !== "auto") {
       return Math.max(MIN_WORKERS, Math.min(ABSOLUTE_MAX_WORKERS, Math.floor(concurrency)));
     }
-    return DEFAULT_SAFE_MAX_WORKERS;
+    return defaultSafeMaxWorkers();
   })();
   const effectiveCoresPerWorker = config?.coresPerWorker ?? DEFAULT_CONFIG.coresPerWorker;
   const effectiveMinParallelFrames = config?.minParallelFrames ?? DEFAULT_CONFIG.minParallelFrames;
@@ -99,7 +178,7 @@ export function calculateOptimalWorkers(
   // Use total memory instead of free memory — macOS reports misleadingly low
   // freemem() because it aggressively caches files in "inactive" memory that
   // is immediately reclaimable.
-  const totalMemoryMB = Math.round(totalmem() / (1024 * 1024));
+  const totalMemoryMB = getSystemTotalMb();
   const memoryBasedWorkers = Math.max(1, Math.floor((totalMemoryMB * 0.5) / MEMORY_PER_WORKER_MB));
 
   const frameBasedWorkers = Math.floor(totalFrames / MIN_FRAMES_PER_WORKER);
@@ -133,24 +212,63 @@ export function distributeFrames(
   totalFrames: number,
   workerCount: number,
   workDir: string,
+  rangeStart: number = 0,
 ): WorkerTask[] {
   const tasks: WorkerTask[] = [];
   const framesPerWorker = Math.ceil(totalFrames / workerCount);
 
   for (let i = 0; i < workerCount; i++) {
-    const startFrame = i * framesPerWorker;
-    const endFrame = Math.min((i + 1) * framesPerWorker, totalFrames);
-    if (startFrame >= totalFrames) break;
+    const startFrame = rangeStart + i * framesPerWorker;
+    const endFrame = Math.min(rangeStart + (i + 1) * framesPerWorker, rangeStart + totalFrames);
+    if (startFrame >= rangeStart + totalFrames) break;
 
     tasks.push({
       workerId: i,
       startFrame,
       endFrame,
       outputDir: join(workDir, `worker-${i}`),
+      outputFrameOffset: rangeStart,
     });
   }
 
   return tasks;
+}
+
+/**
+ * Decide whether a parallel worker should run the per-worker SwiftShader
+ * assertion. Gated to worker 0 only: workers within a chunk share the same
+ * Chrome binary, flags, and OS/driver state, so one verification per chunk
+ * is sufficient. See `heygen-com/hyperframes#955`.
+ */
+export function shouldVerifyWorkerGpu(workerId: number, config?: Partial<EngineConfig>): boolean {
+  return config?.browserGpuMode === "software" && workerId === 0;
+}
+
+async function captureFrameRange(
+  session: CaptureSession,
+  task: WorkerTask,
+  captureOptions: CaptureOptions,
+  signal: AbortSignal | undefined,
+  onFrameCaptured: ((workerId: number, frameIndex: number) => void) | undefined,
+  onFrameBuffer: ((frameIndex: number, buffer: Buffer) => Promise<void>) | undefined,
+): Promise<number> {
+  let framesCaptured = 0;
+  const outputOffset = task.outputFrameOffset ?? 0;
+  for (let i = task.startFrame; i < task.endFrame; i++) {
+    if (signal?.aborted) throw new Error("Parallel worker cancelled");
+    const time = (i * captureOptions.fps.den) / captureOptions.fps.num;
+    const fileFrameIdx = i - outputOffset;
+
+    if (onFrameBuffer) {
+      const { buffer } = await captureFrameToBuffer(session, fileFrameIdx, time);
+      await onFrameBuffer(i, buffer);
+    } else {
+      await captureFrame(session, fileFrameIdx, time);
+    }
+    framesCaptured++;
+    if (onFrameCaptured) onFrameCaptured(task.workerId, i);
+  }
+  return framesCaptured;
 }
 
 async function executeWorkerTask(
@@ -162,6 +280,7 @@ async function executeWorkerTask(
   onFrameCaptured?: (workerId: number, frameIndex: number) => void,
   onFrameBuffer?: (frameIndex: number, buffer: Buffer) => Promise<void>,
   config?: Partial<EngineConfig>,
+  parallel?: boolean,
 ): Promise<WorkerResult> {
   const startTime = Date.now();
   let framesCaptured = 0;
@@ -171,34 +290,38 @@ async function executeWorkerTask(
   let session: CaptureSession | null = null;
   let perf: CapturePerfSummary | undefined;
 
+  const needsSeparateBrowsers = shouldDisableBrowserPoolForParallelWorker({
+    parallel,
+    platform: process.platform,
+    forceScreenshot: config?.forceScreenshot,
+    deviceScaleFactor: captureOptions.deviceScaleFactor,
+    headlessShellPath: resolveHeadlessShellPath(config),
+  });
+  const workerConfig: Partial<EngineConfig> | undefined = needsSeparateBrowsers
+    ? { ...config, enableBrowserPool: false }
+    : config;
+
   try {
     session = await createCaptureSession(
       serverUrl,
       task.outputDir,
       captureOptions,
       createBeforeCaptureHook(),
-      config,
+      workerConfig,
     );
-    await initializeSession(session);
-
-    for (let i = task.startFrame; i < task.endFrame; i++) {
-      if (signal?.aborted) {
-        throw new Error("Parallel worker cancelled");
-      }
-      const time = i / captureOptions.fps;
-
-      if (onFrameBuffer) {
-        // Streaming mode: capture to buffer and invoke callback
-        const { buffer } = await captureFrameToBuffer(session, i, time);
-        await onFrameBuffer(i, buffer);
-      } else {
-        // Disk mode: capture to file
-        await captureFrame(session, i, time);
-      }
-      framesCaptured++;
-
-      if (onFrameCaptured) onFrameCaptured(task.workerId, i);
+    // Worker-0-only SwiftShader assertion — see `shouldVerifyWorkerGpu` and #955.
+    if (shouldVerifyWorkerGpu(task.workerId, workerConfig)) {
+      await assertSwiftShader(session.page, readWebGlVendorInfoFromCanvas);
     }
+    await initializeSession(session);
+    framesCaptured = await captureFrameRange(
+      session,
+      task,
+      captureOptions,
+      signal,
+      onFrameCaptured,
+      onFrameBuffer,
+    );
 
     perf = getCapturePerfSummary(session);
     return {
@@ -211,6 +334,7 @@ async function executeWorkerTask(
     };
   } catch (error) {
     const errMsg = error instanceof Error ? error.message : String(error);
+    const diagnostics = session ? selectWorkerDiagnostics(session.browserConsoleBuffer) : [];
     return {
       workerId: task.workerId,
       framesCaptured,
@@ -219,6 +343,7 @@ async function executeWorkerTask(
       durationMs: Date.now() - startTime,
       perf,
       error: errMsg,
+      diagnostics: diagnostics.length > 0 ? diagnostics : undefined,
     };
   } finally {
     if (session) await closeCaptureSession(session).catch(() => {});
@@ -256,6 +381,7 @@ export async function executeParallelCapture(
     }
   };
 
+  const parallel = tasks.length > 1;
   const results = await Promise.all(
     tasks.map((task) =>
       executeWorkerTask(
@@ -267,13 +393,14 @@ export async function executeParallelCapture(
         onFrameCaptured,
         onFrameBuffer,
         config,
+        parallel,
       ),
     ),
   );
 
   const errors = results.filter((r) => r.error);
   if (errors.length > 0) {
-    const errorMessages = errors.map((e) => `Worker ${e.workerId}: ${e.error}`).join("; ");
+    const errorMessages = errors.map(formatWorkerFailure).join("; ");
     throw new Error(`[Parallel] Capture failed: ${errorMessages}`);
   }
 
@@ -322,7 +449,7 @@ export function getSystemResources(): {
 } {
   return {
     cpuCores: cpus().length,
-    totalMemoryMB: Math.round(totalmem() / (1024 * 1024)),
+    totalMemoryMB: getSystemTotalMb(),
     freeMemoryMB: Math.round(freemem() / (1024 * 1024)),
     recommendedWorkers: calculateOptimalWorkers(1000),
   };

@@ -1,35 +1,54 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, win32 } from "node:path";
 import { tmpdir } from "node:os";
-import type { EngineConfig, ExtractedFrames } from "@hyperframes/engine";
+import type { CaptureOptions, EngineConfig, ExtractedFrames } from "@hyperframes/engine";
+import { executeParallelCapture, mergeWorkerFrames } from "@hyperframes/engine";
 import type { CompiledComposition } from "./htmlCompiler.js";
 
+// Replace only the two engine functions the adaptive-retry loop uses to touch
+// disk; everything else (distributeFrames, types, etc.) stays real so the loop
+// runs for real against a temp framesDir.
+vi.mock("@hyperframes/engine", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@hyperframes/engine")>();
+  return { ...actual, executeParallelCapture: vi.fn(), mergeWorkerFrames: vi.fn() };
+});
+
 import {
-  applyRenderModeHints,
   buildMissingFrameRetryBatches,
+  captureAttemptMadeProgress,
+  describeMemoryExhaustion,
+  executeDiskCaptureWithAdaptiveRetry,
   collectVideoMetadataHints,
   collectVideoReadinessSkipIds,
-  createCaptureCalibrationConfig,
-  createCompiledFrameSrcResolver,
-  estimateMeasuredCaptureCostMultiplier,
-  estimateCaptureCostMultiplier,
   extractStandaloneEntryFromIndex,
   findMissingFrameRanges,
   getNextRetryWorkerCount,
   isRecoverableParallelCaptureError,
+  MAX_TRANSIENT_CAPTURE_RETRIES,
+  resolveCaptureForceScreenshotForPageSideCompositing,
+  shouldDiscardProbeSessionForPageSideCompositing,
+  shouldUseStreamingEncode,
+} from "./renderOrchestrator.js";
+import { ensureFrameWritten } from "./render/stages/captureHdrFrameShared.js";
+import { resolveCompositeTransfer, shouldUseLayeredComposite } from "./hdrCompositor.js";
+import {
+  createCaptureCalibrationConfig,
+  estimateCaptureCostMultiplier,
+  estimateMeasuredCaptureCostMultiplier,
+  resolveRenderWorkerCount,
+  selectCaptureCalibrationFrames,
+  shouldFallbackToScreenshotAfterCalibrationError,
+} from "./render/captureCost.js";
+import {
+  applyRenderModeHints,
+  createCompiledFrameSrcResolver,
   materializeExtractedFramesForCompiledDir,
   projectBrowserEndToCompositionTimeline,
   resolveDeviceScaleFactor,
-  resolveRenderWorkerCount,
-  resolveCompositeTransfer,
-  selectCaptureCalibrationFrames,
-  shouldFallbackToScreenshotAfterCalibrationError,
-  shouldUseLayeredComposite,
-  shouldUseStreamingEncode,
   writeCompiledArtifacts,
-} from "./renderOrchestrator.js";
-import { toExternalAssetKey } from "../utils/paths.js";
+} from "./render/shared.js";
+import { formatCaptureFrameName, toExternalAssetKey } from "../utils/paths.js";
 
 describe("extractStandaloneEntryFromIndex", () => {
   it("reuses the index wrapper and keeps only the requested composition host", () => {
@@ -87,6 +106,271 @@ describe("extractStandaloneEntryFromIndex", () => {
     const extracted = extractStandaloneEntryFromIndex(indexHtml, "compositions/outro.html");
 
     expect(extracted).toBeNull();
+  });
+});
+
+describe("captureAttemptMadeProgress", () => {
+  it("retries when the attempt captured at least one frame toward its target", () => {
+    // targeted 100 frames, 40 still missing -> 60 captured -> worth retrying the rest
+    expect(captureAttemptMadeProgress(100, 40)).toBe(true);
+    expect(captureAttemptMadeProgress(100, 99)).toBe(true);
+  });
+
+  it("bails when the attempt captured nothing (structurally broken composition)", () => {
+    // targeted 100 frames, 100 still missing -> zero progress -> don't burn another timeout cycle
+    expect(captureAttemptMadeProgress(100, 100)).toBe(false);
+    // defensive: never-greater-than guard, treat >= target as no progress
+    expect(captureAttemptMadeProgress(100, 120)).toBe(false);
+  });
+});
+
+describe("executeDiskCaptureWithAdaptiveRetry — zero-progress bail (integration)", () => {
+  const makeLog = () => ({ error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() });
+
+  afterEach(() => {
+    vi.mocked(executeParallelCapture).mockReset();
+    vi.mocked(mergeWorkerFrames).mockReset();
+  });
+
+  it("runs exactly one attempt (no worker-halving retries) when an attempt captures zero frames", async () => {
+    // Capture writes nothing -> framesDir stays empty -> every frame still missing.
+    vi.mocked(executeParallelCapture).mockResolvedValue([]);
+    vi.mocked(mergeWorkerFrames).mockResolvedValue(undefined);
+
+    const workDir = mkdtempSync(join(tmpdir(), "hf-retry-work-"));
+    const framesDir = mkdtempSync(join(tmpdir(), "hf-retry-frames-"));
+    const log = makeLog();
+    try {
+      await expect(
+        executeDiskCaptureWithAdaptiveRetry({
+          serverUrl: "http://localhost:0",
+          workDir,
+          framesDir,
+          totalFrames: 4,
+          initialWorkerCount: 4,
+          allowRetry: true,
+          frameExt: "jpg",
+          captureOptions: {} as CaptureOptions,
+          createBeforeCaptureHook: () => null,
+          cfg: {} as EngineConfig,
+          log,
+          dedupPerfs: [],
+        }),
+      ).rejects.toThrow(/4 frame\(s\) are missing/);
+
+      // The gate under test: without it the loop would walk 4 -> 2 -> 1 workers
+      // (3 capture calls) before giving up. One call proves it bailed immediately.
+      expect(vi.mocked(executeParallelCapture)).toHaveBeenCalledTimes(1);
+      expect(log.warn).toHaveBeenCalledWith(
+        expect.stringContaining("no forward progress"),
+        expect.objectContaining({ attempt: 0, frameCount: 4, remainingCount: 4 }),
+      );
+    } finally {
+      rmSync(workDir, { recursive: true, force: true });
+      rmSync(framesDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("executeDiskCaptureWithAdaptiveRetry — transient Target-closed single retry (integration)", () => {
+  const makeLog = () => ({ error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() });
+
+  const writeAllFrames = (framesDir: string, totalFrames: number): void => {
+    for (let i = 0; i < totalFrames; i++) {
+      writeFileSync(join(framesDir, formatCaptureFrameName(i, "jpg")), "x");
+    }
+  };
+
+  afterEach(() => {
+    vi.mocked(executeParallelCapture).mockReset();
+    vi.mocked(mergeWorkerFrames).mockReset();
+  });
+
+  it("retries ONCE at the same worker count on a transient Target closed with zero progress", async () => {
+    const workDir = mkdtempSync(join(tmpdir(), "hf-transient-work-"));
+    const framesDir = mkdtempSync(join(tmpdir(), "hf-transient-frames-"));
+    const log = makeLog();
+    let call = 0;
+    // First attempt: the tab dies before any frame is captured (frame 0) — zero
+    // forward progress, which the worker-halving retry deliberately bails on.
+    // The transient retry recovers it without changing the worker count.
+    vi.mocked(executeParallelCapture).mockImplementation(async () => {
+      call++;
+      if (call === 1) {
+        throw new Error("Protocol error (Page.captureScreenshot): Target closed");
+      }
+      writeAllFrames(framesDir, 4);
+      return [];
+    });
+    vi.mocked(mergeWorkerFrames).mockResolvedValue(undefined);
+
+    try {
+      const attempts = await executeDiskCaptureWithAdaptiveRetry({
+        serverUrl: "http://localhost:0",
+        workDir,
+        framesDir,
+        totalFrames: 4,
+        initialWorkerCount: 1,
+        allowRetry: true,
+        frameExt: "jpg",
+        captureOptions: {} as CaptureOptions,
+        createBeforeCaptureHook: () => null,
+        cfg: {} as EngineConfig,
+        log,
+        dedupPerfs: [],
+      });
+
+      expect(vi.mocked(executeParallelCapture)).toHaveBeenCalledTimes(2);
+      // Both attempts ran at the same worker count (transient retry doesn't halve).
+      expect(attempts.map((a) => a.workers)).toEqual([1, 1]);
+      // The retry attempt is tagged `transient-retry` (vs the worker-halving
+      // `retry`) so it's countable for telemetry (dashboard 1783183).
+      expect(attempts.map((a) => a.reason)).toEqual(["initial", "transient-retry"]);
+      expect(log.warn).toHaveBeenCalledWith(
+        expect.stringContaining("Transient browser failure"),
+        expect.objectContaining({ transientRetriesUsed: 1 }),
+      );
+    } finally {
+      rmSync(workDir, { recursive: true, force: true });
+      rmSync(framesDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does NOT retry a transient error when the render was aborted", async () => {
+    const workDir = mkdtempSync(join(tmpdir(), "hf-transient-abort-work-"));
+    const framesDir = mkdtempSync(join(tmpdir(), "hf-transient-abort-frames-"));
+    const log = makeLog();
+    const controller = new AbortController();
+    // Cancellation tears the browser down, surfacing as a transient-looking
+    // "Target closed" — but an aborted render must fail immediately, not retry.
+    vi.mocked(executeParallelCapture).mockImplementation(async () => {
+      controller.abort();
+      throw new Error("Target closed");
+    });
+    vi.mocked(mergeWorkerFrames).mockResolvedValue(undefined);
+
+    try {
+      await expect(
+        executeDiskCaptureWithAdaptiveRetry({
+          serverUrl: "http://localhost:0",
+          workDir,
+          framesDir,
+          totalFrames: 4,
+          initialWorkerCount: 2,
+          allowRetry: true,
+          frameExt: "jpg",
+          captureOptions: {} as CaptureOptions,
+          createBeforeCaptureHook: () => null,
+          abortSignal: controller.signal,
+          cfg: {} as EngineConfig,
+          log,
+          dedupPerfs: [],
+        }),
+      ).rejects.toThrow(/Target closed/);
+
+      // Exactly one attempt — no transient retry burned on a cancelled render.
+      expect(vi.mocked(executeParallelCapture)).toHaveBeenCalledTimes(1);
+      expect(log.warn).not.toHaveBeenCalledWith(
+        expect.stringContaining("Transient browser failure"),
+        expect.anything(),
+      );
+    } finally {
+      rmSync(workDir, { recursive: true, force: true });
+      rmSync(framesDir, { recursive: true, force: true });
+    }
+  });
+
+  it("gives up after MAX_TRANSIENT_CAPTURE_RETRIES when the tab keeps dying", async () => {
+    const workDir = mkdtempSync(join(tmpdir(), "hf-transient2-work-"));
+    const framesDir = mkdtempSync(join(tmpdir(), "hf-transient2-frames-"));
+    const log = makeLog();
+    vi.mocked(executeParallelCapture).mockRejectedValue(new Error("Session closed"));
+    vi.mocked(mergeWorkerFrames).mockResolvedValue(undefined);
+
+    try {
+      await expect(
+        executeDiskCaptureWithAdaptiveRetry({
+          serverUrl: "http://localhost:0",
+          workDir,
+          framesDir,
+          totalFrames: 4,
+          initialWorkerCount: 1,
+          allowRetry: true,
+          frameExt: "jpg",
+          captureOptions: {} as CaptureOptions,
+          createBeforeCaptureHook: () => null,
+          cfg: {} as EngineConfig,
+          log,
+          dedupPerfs: [],
+        }),
+      ).rejects.toThrow(/Session closed/);
+
+      // 1 initial attempt + exactly MAX_TRANSIENT_CAPTURE_RETRIES retries.
+      expect(vi.mocked(executeParallelCapture)).toHaveBeenCalledTimes(
+        1 + MAX_TRANSIENT_CAPTURE_RETRIES,
+      );
+    } finally {
+      rmSync(workDir, { recursive: true, force: true });
+      rmSync(framesDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("describeMemoryExhaustion", () => {
+  it("returns actionable guidance for a memory-exhaustion error", () => {
+    const msg = describeMemoryExhaustion(new Error("Set maximum size exceeded"), {
+      width: 3840,
+      height: 2160,
+      totalFrames: 5400,
+    });
+    expect(msg).not.toBeNull();
+    expect(msg).toContain("ran out of memory");
+    expect(msg).toContain("3840×2160");
+    expect(msg).toContain("5400 frames");
+    expect(msg).toContain("Set maximum size exceeded");
+    expect(msg).toContain("--low-memory-mode");
+  });
+
+  it("omits dimensions when they are unknown", () => {
+    const msg = describeMemoryExhaustion(new Error("JavaScript heap out of memory"), {});
+    expect(msg).not.toBeNull();
+    expect(msg).not.toContain("×");
+  });
+
+  it("returns null for a non-memory error (leaves the original message intact)", () => {
+    expect(
+      describeMemoryExhaustion(new Error("Target closed"), {
+        width: 1920,
+        height: 1080,
+        totalFrames: 100,
+      }),
+    ).toBeNull();
+  });
+});
+
+describe("ensureFrameWritten", () => {
+  it("returns without throwing when the frame was written", () => {
+    expect(() => ensureFrameWritten(true, 0)).not.toThrow();
+  });
+
+  it("throws a bare frame-indexed error when no encoder context is supplied", () => {
+    expect(() => ensureFrameWritten(false, 7)).toThrow(
+      "Streaming encoder exited before frame 7 was written",
+    );
+  });
+
+  it("includes the ffmpeg exit reason when the encoder reports one", () => {
+    const encoder = { getExitError: () => "FFmpeg exited with code 1: Unknown encoder 'libx264'" };
+    expect(() => ensureFrameWritten(false, 0, encoder)).toThrow(
+      /Streaming encoder exited before frame 0 was written: FFmpeg exited with code 1: Unknown encoder 'libx264'/,
+    );
+  });
+
+  it("falls back to the bare message when the encoder has no exit reason yet", () => {
+    const encoder = { getExitError: () => undefined };
+    expect(() => ensureFrameWritten(false, 3, encoder)).toThrow(
+      "Streaming encoder exited before frame 3 was written",
+    );
   });
 });
 
@@ -198,6 +482,9 @@ describe("materializeExtractedFramesForCompiledDir", () => {
         symlinkSync: () => {
           throw new Error("inside compiledDir should not symlink");
         },
+        cpSync: () => {
+          throw new Error("inside compiledDir should not copy");
+        },
       },
     });
 
@@ -205,6 +492,7 @@ describe("materializeExtractedFramesForCompiledDir", () => {
     expect(extracted.framePaths.get(0)).toBe(framePath);
   });
 
+  // fallow-ignore-next-line code-duplication
   it("remaps Windows cache frames under compiledDir using only the frame basename", () => {
     const compiledDir = win32.resolve("C:\\compiled");
     const outputDir = win32.resolve("D:\\cache\\abc123");
@@ -212,6 +500,7 @@ describe("materializeExtractedFramesForCompiledDir", () => {
     const extracted = createExtractedFrames(outputDir, framePath);
     const symlinks: Array<{ target: string; path: string }> = [];
 
+    // fallow-ignore-next-line code-duplication
     materializeExtractedFramesForCompiledDir([extracted], compiledDir, {
       pathModule: win32,
       fileSystem: {
@@ -219,6 +508,9 @@ describe("materializeExtractedFramesForCompiledDir", () => {
         mkdirSync: () => undefined,
         symlinkSync: (target, path) => {
           symlinks.push({ target, path });
+        },
+        cpSync: () => {
+          throw new Error("symlink path should not invoke cpSync");
         },
       },
     });
@@ -228,6 +520,39 @@ describe("materializeExtractedFramesForCompiledDir", () => {
     expect(extracted.framePaths.get(0)).toBe(win32.join(linkPath, "frame_000001.jpg"));
     expect(extracted.framePaths.get(0)).not.toContain(outputDir);
     expect(symlinks).toEqual([{ target: outputDir, path: linkPath }]);
+  });
+
+  // fallow-ignore-next-line code-duplication
+  it("recursively copies frames into compiledDir when materializeSymlinks is true", () => {
+    // Distributed plan() must produce a self-contained planDir — symlinks
+    // don't survive S3 / GCS round-trips. With materializeSymlinks=true the
+    // helper invokes cpSync(recursive) instead of symlinkSync.
+    const compiledDir = win32.resolve("C:\\compiled");
+    const outputDir = win32.resolve("D:\\cache\\abc123");
+    const framePath = win32.join(outputDir, "frame_000001.jpg");
+    const extracted = createExtractedFrames(outputDir, framePath);
+    const copies: Array<{ src: string; dest: string; recursive: boolean }> = [];
+
+    // fallow-ignore-next-line code-duplication
+    materializeExtractedFramesForCompiledDir([extracted], compiledDir, {
+      pathModule: win32,
+      fileSystem: {
+        existsSync: () => false,
+        mkdirSync: () => undefined,
+        symlinkSync: () => {
+          throw new Error("copy path should not invoke symlinkSync");
+        },
+        cpSync: (src, dest, options) => {
+          copies.push({ src, dest, recursive: options.recursive });
+        },
+      },
+      materializeSymlinks: true,
+    });
+
+    const linkPath = win32.join(compiledDir, "__hyperframes_video_frames", "video-1");
+    expect(extracted.outputDir).toBe(linkPath);
+    expect(extracted.framePaths.get(0)).toBe(win32.join(linkPath, "frame_000001.jpg"));
+    expect(copies).toEqual([{ src: outputDir, dest: linkPath, recursive: true }]);
   });
 });
 
@@ -289,7 +614,10 @@ describe("writeCompiledArtifacts — external assets on Windows drive-letter pat
   });
 
   it("rejects a maliciously crafted key that tries to escape compileDir", () => {
-    const workDir = makeWorkDir();
+    const sandboxRoot = mkdtempSync(join(tmpdir(), "hf-orch-root-"));
+    tempDirs.push(sandboxRoot);
+    const workDir = join(sandboxRoot, "work", "inner");
+    mkdirSync(workDir, { recursive: true });
     const sourceDir = mkdtempSync(join(tmpdir(), "hf-src-"));
     tempDirs.push(sourceDir);
     const srcFile = join(sourceDir, "evil.wav");
@@ -315,7 +643,7 @@ describe("writeCompiledArtifacts — external assets on Windows drive-letter pat
 
     writeCompiledArtifacts(compiled, workDir, false);
 
-    const escapeTarget = join(workDir, "..", "..", "etc", "passwd");
+    const escapeTarget = join(workDir, "etc", "passwd");
     expect(existsSync(escapeTarget)).toBe(false);
   });
 });
@@ -344,6 +672,7 @@ function createCompiledComposition(
   };
 }
 
+// fallow-ignore-next-line code-duplication
 function createConfig(): EngineConfig {
   return {
     fps: 30,
@@ -360,6 +689,7 @@ function createConfig(): EngineConfig {
     browserTimeout: 120000,
     protocolTimeout: 300000,
     forceScreenshot: false,
+    lowMemoryMode: false,
     enableChunkedEncode: false,
     chunkSizeFrames: 360,
     enableStreamingEncode: false,
@@ -380,8 +710,8 @@ function createConfig(): EngineConfig {
 }
 
 describe("applyRenderModeHints", () => {
+  // fallow-ignore-next-line code-duplication
   it("forces screenshot mode when compatibility hints recommend it", () => {
-    const cfg = createConfig();
     const compiled = createCompiledComposition(["iframe", "requestAnimationFrame"]);
     const log = {
       error: vi.fn(),
@@ -390,15 +720,13 @@ describe("applyRenderModeHints", () => {
       debug: vi.fn(),
     };
 
-    applyRenderModeHints(cfg, compiled, log);
+    const result = applyRenderModeHints(false, compiled, log);
 
-    expect(cfg.forceScreenshot).toBe(true);
+    expect(result).toEqual({ forceScreenshot: true, autoSelected: true });
     expect(log.warn).toHaveBeenCalledOnce();
   });
 
   it("does nothing when screenshot mode is already forced", () => {
-    const cfg = createConfig();
-    cfg.forceScreenshot = true;
     const compiled = createCompiledComposition(["iframe"]);
     const log = {
       error: vi.fn(),
@@ -407,8 +735,25 @@ describe("applyRenderModeHints", () => {
       debug: vi.fn(),
     };
 
-    applyRenderModeHints(cfg, compiled, log);
+    const result = applyRenderModeHints(true, compiled, log);
 
+    expect(result).toEqual({ forceScreenshot: true, autoSelected: false });
+    expect(log.warn).not.toHaveBeenCalled();
+  });
+
+  // fallow-ignore-next-line code-duplication
+  it("returns false when neither caller nor hint forces", () => {
+    const compiled = createCompiledComposition([]);
+    const log = {
+      error: vi.fn(),
+      warn: vi.fn(),
+      info: vi.fn(),
+      debug: vi.fn(),
+    };
+
+    const result = applyRenderModeHints(false, compiled, log);
+
+    expect(result).toEqual({ forceScreenshot: false, autoSelected: false });
     expect(log.warn).not.toHaveBeenCalled();
   });
 });
@@ -507,6 +852,107 @@ describe("resolveRenderWorkerCount", () => {
     expect(workers).toBe(1);
   });
 
+  // fallow-ignore-next-line code-duplication
+  it("forces single worker when html-in-canvas is detected", () => {
+    const log = {
+      error: vi.fn(),
+      warn: vi.fn(),
+      info: vi.fn(),
+      debug: vi.fn(),
+    };
+
+    const workers = resolveRenderWorkerCount(
+      900,
+      undefined,
+      cfg,
+      {
+        hasShaderTransitions: false,
+        renderModeHints: {
+          recommendScreenshot: false,
+          reasons: [{ code: "htmlInCanvas", message: "layoutsubtree canvas" }],
+        },
+      },
+      log,
+    );
+
+    expect(workers).toBe(1);
+    expect(log.warn).toHaveBeenCalledOnce();
+  });
+
+  // fallow-ignore-next-line code-duplication
+  it("overrides explicit --workers when html-in-canvas is detected", () => {
+    const log = {
+      error: vi.fn(),
+      warn: vi.fn(),
+      info: vi.fn(),
+      debug: vi.fn(),
+    };
+
+    const workers = resolveRenderWorkerCount(
+      900,
+      8,
+      cfg,
+      {
+        hasShaderTransitions: false,
+        renderModeHints: {
+          recommendScreenshot: false,
+          reasons: [{ code: "htmlInCanvas", message: "layoutsubtree canvas" }],
+        },
+      },
+      log,
+    );
+
+    expect(workers).toBe(1);
+    expect(log.warn).toHaveBeenCalledOnce();
+  });
+
+  // fallow-ignore-next-line code-duplication
+  it("pins to 1 worker in low-memory mode when no explicit --workers is set", () => {
+    const log = {
+      error: vi.fn(),
+      warn: vi.fn(),
+      info: vi.fn(),
+      debug: vi.fn(),
+    };
+
+    const workers = resolveRenderWorkerCount(
+      900,
+      undefined,
+      { ...cfg, lowMemoryMode: true },
+      {
+        hasShaderTransitions: false,
+        renderModeHints: { recommendScreenshot: false, reasons: [] },
+      },
+      log,
+    );
+
+    expect(workers).toBe(1);
+    expect(log.info).toHaveBeenCalledOnce();
+  });
+
+  // fallow-ignore-next-line code-duplication
+  it("respects explicit --workers in low-memory mode (only the pin is bypassed)", () => {
+    const log = {
+      error: vi.fn(),
+      warn: vi.fn(),
+      info: vi.fn(),
+      debug: vi.fn(),
+    };
+
+    const workers = resolveRenderWorkerCount(
+      900,
+      4,
+      { ...cfg, lowMemoryMode: true, coresPerWorker: 2.5 },
+      {
+        hasShaderTransitions: false,
+        renderModeHints: { recommendScreenshot: false, reasons: [] },
+      },
+      log,
+    );
+
+    expect(workers).toBe(4);
+  });
+
   it("keeps baseline auto workers after screenshot fallback when measured capture is cheap", () => {
     const log = {
       error: vi.fn(),
@@ -529,6 +975,58 @@ describe("resolveRenderWorkerCount", () => {
 
     expect(workers).toBe(6);
     expect(log.warn).not.toHaveBeenCalled();
+  });
+});
+
+describe("resolveCaptureForceScreenshotForPageSideCompositing", () => {
+  it("forces screenshot capture when page-side shader compositing is active", () => {
+    expect(
+      resolveCaptureForceScreenshotForPageSideCompositing({
+        forceScreenshot: false,
+        usePageSideCompositing: true,
+      }),
+    ).toBe(true);
+  });
+
+  it("preserves the existing capture mode when page-side compositing is inactive", () => {
+    expect(
+      resolveCaptureForceScreenshotForPageSideCompositing({
+        forceScreenshot: false,
+        usePageSideCompositing: false,
+      }),
+    ).toBe(false);
+    expect(
+      resolveCaptureForceScreenshotForPageSideCompositing({
+        forceScreenshot: true,
+        usePageSideCompositing: false,
+      }),
+    ).toBe(true);
+  });
+});
+
+describe("shouldDiscardProbeSessionForPageSideCompositing", () => {
+  it("discards a previously-loaded probe page when page-side compositing is selected", () => {
+    expect(
+      shouldDiscardProbeSessionForPageSideCompositing({
+        hasProbeSession: true,
+        usePageSideCompositing: true,
+      }),
+    ).toBe(true);
+  });
+
+  it("reuses the probe session when no page-side pre-head script is required", () => {
+    expect(
+      shouldDiscardProbeSessionForPageSideCompositing({
+        hasProbeSession: true,
+        usePageSideCompositing: false,
+      }),
+    ).toBe(false);
+    expect(
+      shouldDiscardProbeSessionForPageSideCompositing({
+        hasProbeSession: false,
+        usePageSideCompositing: true,
+      }),
+    ).toBe(false);
   });
 });
 
@@ -622,18 +1120,21 @@ describe("selectCaptureCalibrationFrames", () => {
 });
 
 describe("capture calibration safeguards", () => {
-  it("uses a bounded protocol timeout for calibration probes", () => {
+  it("caps protocol timeout at calibration ceiling for fast fallback", () => {
     const cfg = createConfig();
     const calibrationCfg = createCaptureCalibrationConfig(cfg);
 
+    // Default 300s is above the 30s calibration ceiling — cap at 30s
+    // so a wedged BeginFrame times out fast and falls back to screenshot
     expect(calibrationCfg.protocolTimeout).toBe(30000);
     expect(cfg.protocolTimeout).toBe(300000);
   });
 
-  it("preserves smaller explicit protocol timeouts for calibration probes", () => {
+  it("preserves user timeout when already below calibration ceiling", () => {
     const cfg = createConfig();
     cfg.protocolTimeout = 5000;
 
+    // 5s is below the 30s ceiling — keep the user's value
     expect(createCaptureCalibrationConfig(cfg).protocolTimeout).toBe(5000);
   });
 
@@ -815,6 +1316,14 @@ describe("resolveDeviceScaleFactor", () => {
     ).toThrow(/aspect ratio/);
   });
 
+  it("suggests the matching-orientation preset in the aspect-mismatch message", () => {
+    // Landscape composition + portrait preset → the message should point at
+    // the landscape swap so the user isn't left to guess (workstream P1-3).
+    expect(() => resolveDeviceScaleFactor({ ...defaults, outputResolution: "portrait" })).toThrow(
+      /--resolution landscape/,
+    );
+  });
+
   it("rejects downsampling (4K composition → 1080p output)", () => {
     expect(() =>
       resolveDeviceScaleFactor({
@@ -838,5 +1347,38 @@ describe("resolveDeviceScaleFactor", () => {
         outputResolution: "landscape-4k",
       }),
     ).toThrow(/aspect ratio|non-integer/);
+  });
+
+  it("returns 1 for a square comp matching the square preset", () => {
+    expect(
+      resolveDeviceScaleFactor({
+        ...defaults,
+        compositionWidth: 1080,
+        compositionHeight: 1080,
+        outputResolution: "square",
+      }),
+    ).toBe(1);
+  });
+
+  it("returns 2 for square 1080 → square-4k", () => {
+    expect(
+      resolveDeviceScaleFactor({
+        ...defaults,
+        compositionWidth: 1080,
+        compositionHeight: 1080,
+        outputResolution: "square-4k",
+      }),
+    ).toBe(2);
+  });
+
+  it("rejects landscape preset on a square composition", () => {
+    expect(() =>
+      resolveDeviceScaleFactor({
+        ...defaults,
+        compositionWidth: 1080,
+        compositionHeight: 1080,
+        outputResolution: "landscape",
+      }),
+    ).toThrow(/aspect ratio/);
   });
 });

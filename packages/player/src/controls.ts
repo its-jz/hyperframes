@@ -21,6 +21,14 @@ export const SPEED_PRESETS = [0.25, 0.5, 1, 1.5, 2, 4] as const;
 export interface ControlsOptions {
   /** Speed presets shown in the menu. Defaults to SPEED_PRESETS. */
   speedPresets?: readonly number[];
+  /**
+   * When true, the volume controls (mute button + volume slider) are hidden so
+   * the viewer cannot change the audio state. Backs the `audio-locked`
+   * attribute on `<hyperframes-player>`, which enforces host-mandated silent
+   * playback (e.g. a HyperFrames project embedded in a chat host). Toggleable
+   * at runtime via the returned `setVolumeControlsHidden`.
+   */
+  audioLocked?: boolean;
 }
 
 export function formatSpeed(speed: number): string {
@@ -48,6 +56,7 @@ export function createControls(
   updateSpeed: (speed: number) => void;
   updateMuted: (muted: boolean) => void;
   updateVolume: (volume: number) => void;
+  setVolumeControlsHidden: (hidden: boolean) => void;
   show: () => void;
   hide: () => void;
   destroy: () => void;
@@ -64,7 +73,10 @@ export function createControls(
   const playBtn = document.createElement("button");
   playBtn.className = "hfp-play-btn";
   playBtn.type = "button";
-  playBtn.innerHTML = PLAY_ICON;
+  // Both glyphs stay in the DOM, stacked; toggling `hfp-playing` crossfade-morphs
+  // between them (see styles.ts) instead of swapping innerHTML, which would kill
+  // the transition.
+  playBtn.innerHTML = `<span class="hfp-ico hfp-ico-play">${PLAY_ICON}</span><span class="hfp-ico hfp-ico-pause">${PAUSE_ICON}</span>`;
   playBtn.setAttribute("aria-label", "Play");
 
   const scrubber = document.createElement("div");
@@ -132,6 +144,11 @@ export function createControls(
 
   volumeWrap.appendChild(volumeSliderWrap);
   volumeWrap.appendChild(muteBtn);
+
+  // Audio-locked: hide the whole volume control (mute toggle + slider) so the
+  // viewer has no UI path to turn sound on. The player still mutes the media
+  // independently via the `muted` attribute; this only removes the controls.
+  if (options.audioLocked) volumeWrap.style.display = "none";
 
   controls.appendChild(playBtn);
   controls.appendChild(scrubber);
@@ -316,13 +333,15 @@ export function createControls(
   };
 
   const host = parent instanceof ShadowRoot ? (parent.host as HTMLElement) : parent;
-  host.addEventListener("mousemove", () => {
+  const onHostMouseMove = () => {
     controls.classList.remove("hfp-hidden");
     startHideTimer();
-  });
-  host.addEventListener("mouseleave", () => {
+  };
+  const onHostMouseLeave = () => {
     if (isPlaying) controls.classList.add("hfp-hidden");
-  });
+  };
+  host.addEventListener("mousemove", onHostMouseMove);
+  host.addEventListener("mouseleave", onHostMouseLeave);
 
   return {
     updateTime(current: number, duration: number) {
@@ -334,7 +353,7 @@ export function createControls(
     },
     updatePlaying(playing: boolean) {
       isPlaying = playing;
-      playBtn.innerHTML = playing ? PAUSE_ICON : PLAY_ICON;
+      playBtn.classList.toggle("hfp-playing", playing);
       playBtn.setAttribute("aria-label", playing ? "Pause" : "Play");
       if (playing) startHideTimer();
       else controls.classList.remove("hfp-hidden");
@@ -356,6 +375,9 @@ export function createControls(
       volumeSlider.setAttribute("aria-valuenow", String(Math.round(volume * 100)));
       muteBtn.innerHTML = getVolumeIcon(isMuted, volume);
     },
+    setVolumeControlsHidden(hidden: boolean) {
+      volumeWrap.style.display = hidden ? "none" : "";
+    },
     show() {
       controls.style.display = "";
     },
@@ -372,7 +394,10 @@ export function createControls(
       document.removeEventListener("touchmove", onVolumeTouchMove);
       document.removeEventListener("touchend", onVolumeTouchEnd);
       document.removeEventListener("click", onDocClick);
+      host.removeEventListener("mousemove", onHostMouseMove);
+      host.removeEventListener("mouseleave", onHostMouseLeave);
       if (hideTimeout) clearTimeout(hideTimeout);
+      controls.remove();
     },
   };
 }

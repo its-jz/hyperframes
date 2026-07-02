@@ -1,3 +1,4 @@
+// fallow-ignore-file unused-type code-duplication complexity
 /**
  * Streaming Encoder Service
  *
@@ -9,10 +10,12 @@
  *   1. Frame reorder buffer – ensures out-of-order parallel workers feed
  *      frames to FFmpeg stdin in sequential order.
  *   2. Streaming FFmpeg encoder – spawns FFmpeg with `-f image2pipe` and
- *      exposes a `writeFrame(buffer)` + `close()` API.
+ *      exposes an async `writeFrame(buffer)` + `close()` API.
  */
 
 import { spawn, type ChildProcess } from "child_process";
+import { once } from "events";
+import { trackChildProcess } from "../utils/processTracker.js";
 import { existsSync, mkdirSync, statSync } from "fs";
 import { dirname } from "path";
 
@@ -23,9 +26,12 @@ import {
   mapPresetForGpuEncoder,
 } from "../utils/gpuEncoder.js";
 import { formatFfmpegError } from "../utils/runFfmpeg.js";
+import { getFfmpegBinary } from "../utils/ffmpegBinaries.js";
 import { getHdrEncoderColorParams } from "../utils/hdr.js";
-import { type EncoderOptions } from "./chunkEncoder.types.js";
+import { withEvenDimensionPad } from "../utils/evenDimensions.js";
 import { DEFAULT_CONFIG, type EngineConfig } from "../config.js";
+import { fpsToFfmpegArg, type Fps } from "@hyperframes/core";
+import { appendVp9CpuUsedArg } from "./vp9Options.js";
 
 // Re-export EncoderOptions so callers can reference the type via this module.
 export type { EncoderOptions } from "./chunkEncoder.types.js";
@@ -99,7 +105,8 @@ export function createFrameReorderBuffer(startFrame: number, endFrame: number): 
 // ---------------------------------------------------------------------------
 
 export interface StreamingEncoderOptions {
-  fps: number;
+  /** Frame rate as an exact rational; see `Fps` in @hyperframes/core. */
+  fps: Fps;
   width: number;
   height: number;
   codec?: "h264" | "h265" | "vp9" | "prores";
@@ -107,6 +114,8 @@ export interface StreamingEncoderOptions {
   quality?: number;
   bitrate?: string;
   pixelFormat?: string;
+  /** libvpx-vp9 -cpu-used value. Defaults to the engine VP9 setting. */
+  vp9CpuUsed?: number;
   useGpu?: boolean;
   imageFormat?: "jpeg" | "png";
   hdr?: { transfer: import("../utils/hdr.js").HdrTransfer };
@@ -122,9 +131,23 @@ export interface StreamingEncoderResult {
 }
 
 export interface StreamingEncoder {
-  writeFrame: (buffer: Buffer) => boolean;
+  /**
+   * Write one frame to FFmpeg stdin, awaiting `drain` when the pipe is full
+   * so back-pressure propagates to the caller. Resolves `false` when FFmpeg
+   * is already gone. Callers must serialize calls — one in-flight writeFrame
+   * per encoder (the frame reorder buffer provides this ordering); concurrent
+   * calls would interleave frame bytes on the pipe and race the drain wait.
+   */
+  writeFrame: (buffer: Buffer) => Promise<boolean>;
   close: () => Promise<StreamingEncoderResult>;
   getExitStatus: () => "running" | "success" | "error";
+  /**
+   * The FFmpeg failure reason (exit code + tail of stderr), or `undefined`
+   * while the process is still running / exited cleanly. Lets a `writeFrame`
+   * that returned `false` because FFmpeg died surface WHY it died (bad args,
+   * unsupported codec, disk full) instead of a bare "encoder exited" message.
+   */
+  getExitError: () => string | undefined;
 }
 
 /**
@@ -147,6 +170,7 @@ export function buildStreamingArgs(
     quality = 23,
     bitrate,
     pixelFormat = "yuv420p",
+    vp9CpuUsed,
     useGpu = false,
     imageFormat = "jpeg",
   } = options;
@@ -169,7 +193,7 @@ export function buildStreamingArgs(
       "-s",
       `${options.width}x${options.height}`,
       "-framerate",
-      String(fps),
+      fpsToFfmpegArg(fps),
     );
     if (inputColorTrc) {
       args.push(
@@ -184,9 +208,18 @@ export function buildStreamingArgs(
     args.push("-i", "-");
   } else {
     const inputCodec = imageFormat === "png" ? "png" : "mjpeg";
-    args.push("-f", "image2pipe", "-vcodec", inputCodec, "-framerate", String(fps), "-i", "-");
+    args.push(
+      "-f",
+      "image2pipe",
+      "-vcodec",
+      inputCodec,
+      "-framerate",
+      fpsToFfmpegArg(fps),
+      "-i",
+      "-",
+    );
   }
-  args.push("-r", String(fps));
+  args.push("-r", fpsToFfmpegArg(fps));
 
   const shouldUseGpu = useGpu && gpuEncoder !== null;
 
@@ -220,14 +253,21 @@ export function buildStreamingArgs(
           if (bitrate) args.push("-b:v", bitrate);
           else args.push("-global_quality", String(quality));
           break;
+        case "amf":
+          if (bitrate) args.push("-b:v", bitrate);
+          else args.push("-rc", "cqp", "-qp_i", String(quality), "-qp_p", String(quality));
+          break;
       }
 
-      // Mirror SW branch: GPU h264 paths emit B-frames by default (nvenc, qsv,
-      // vaapi) and produce the same negative-DTS freeze for downstream players.
+      // Mirror SW branch: GPU h264 paths emit B-frames by default (nvenc, amf,
+      // qsv, vaapi) and produce the same negative-DTS freeze for downstream players.
       // See chunkEncoder.buildEncoderArgs for the full explanation.
       if (
         codec === "h264" &&
-        (gpuEncoder === "nvenc" || gpuEncoder === "qsv" || gpuEncoder === "vaapi")
+        (gpuEncoder === "nvenc" ||
+          gpuEncoder === "qsv" ||
+          gpuEncoder === "vaapi" ||
+          gpuEncoder === "amf")
       ) {
         args.push("-bf", "0");
         if (gpuEncoder === "qsv") {
@@ -272,6 +312,7 @@ export function buildStreamingArgs(
     args.push("-c:v", "libvpx-vp9", "-b:v", bitrate || "0", "-crf", String(quality));
     args.push("-deadline", preset === "ultrafast" ? "realtime" : "good");
     args.push("-row-mt", "1");
+    appendVp9CpuUsedArg(args, vp9CpuUsed);
     if (pixelFormat === "yuva420p") {
       args.push("-auto-alt-ref", "0");
       args.push("-metadata:s:v:0", "alpha_mode=1");
@@ -317,13 +358,24 @@ export function buildStreamingArgs(
     if (options.rawInputFormat) {
       // No filter needed — PQ data goes straight to encoder
     } else if (gpuEncoder === "vaapi") {
+      // vaapi already runs `format=nv12,hwupload`; the nv12 conversion aligns
+      // odd dimensions before upload, so only prepend the range conversion.
       const vfIdx = args.indexOf("-vf");
       if (vfIdx !== -1) {
         args[vfIdx + 1] = `scale=in_range=pc:out_range=tv,${args[vfIdx + 1]}`;
       }
-    } else if (!shouldUseGpu) {
-      // Range conversion: Chrome screenshots are full-range RGB.
-      args.push("-vf", "scale=in_range=pc:out_range=tv");
+    } else if (shouldUseGpu) {
+      // nvenc/videotoolbox/qsv/amf feed software frames straight to the HW
+      // encoder with no `-vf`. They hit the same "height not divisible by 2"
+      // abort as libx264 on an odd-sized 4:2:0 canvas, so pad odd dimensions
+      // up to even on the software side before the encode.
+      const vf = withEvenDimensionPad("", pixelFormat);
+      if (vf) args.push("-vf", vf);
+    } else {
+      // Range conversion: Chrome screenshots are full-range RGB. Pad odd
+      // dimensions up to even so libx264/libx265 (4:2:0) don't abort with
+      // "height not divisible by 2" on an odd-sized composition canvas.
+      args.push("-vf", withEvenDimensionPad("scale=in_range=pc:out_range=tv", pixelFormat));
     }
 
     // Fixed timescale for consistent A/V timing across platforms.
@@ -362,9 +414,10 @@ export async function spawnStreamingEncoder(
   const args = buildStreamingArgs(options, outputPath, gpuEncoder);
 
   const startTime = Date.now();
-  const ffmpeg: ChildProcess = spawn("ffmpeg", args, {
+  const ffmpeg: ChildProcess = spawn(getFfmpegBinary(), args, {
     stdio: ["pipe", "pipe", "pipe"],
   });
+  trackChildProcess(ffmpeg);
 
   let exitStatus: "running" | "success" | "error" = "running";
   let stderr = "";
@@ -389,6 +442,9 @@ export async function spawnStreamingEncoder(
     exitPromiseResolve?.();
   });
 
+  ffmpeg.stdin?.on("error", () => {});
+  ffmpeg.stdout?.on("error", () => {});
+
   // Handle abort signal
   const onAbort = () => {
     if (exitStatus === "running") {
@@ -403,28 +459,96 @@ export async function spawnStreamingEncoder(
     }
   }
 
-  // Timeout safety
+  // Inactivity timeout: fires only when no frame has been written for
+  // `ffmpegStreamingTimeout` ms. A slow-but-progressing capture (e.g. a CI
+  // runner under load) keeps resetting the timer on each writeFrame, so total
+  // wall-clock render time is unbounded — only a true hang (Chrome dead,
+  // capture stuck, no frames arriving) trips SIGTERM. The 600s default was
+  // previously a total-render cap, which intermittently killed legitimate
+  // slow renders mid-encode (FFmpeg got SIGTERM after most frames were sent;
+  // libx264 printed its summary and exited 255, observable as
+  // "Streaming encode failed: FFmpeg exited with code 255" with audio:0kB).
   const streamingTimeout = config?.ffmpegStreamingTimeout ?? DEFAULT_CONFIG.ffmpegStreamingTimeout;
-  const timer = setTimeout(() => {
-    if (exitStatus === "running") {
-      ffmpeg.kill("SIGTERM");
+  let timer: NodeJS.Timeout | null = null;
+  const resetTimer = () => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      if (exitStatus === "running") {
+        ffmpeg.kill("SIGTERM");
+      }
+    }, streamingTimeout);
+  };
+  resetTimer();
+
+  const waitForDrainOrExit = async (
+    stdin: NonNullable<ChildProcess["stdin"]>,
+  ): Promise<"drain" | "exit"> => {
+    // Back-pressure can hit once per frame. Do not race `exitPromise.then(...)`
+    // here: V8 retains `.then` reaction-list entries on an unsettled promise,
+    // so a one-hour 30fps render under steady back-pressure can accumulate
+    // ~108K closures + AbortControllers. Use one-shot listeners for this write
+    // instead, then abort them in finally. `close` is the event that flips
+    // `exitStatus`; re-check after listener attachment so a close emitted
+    // between `stdin.write(false)` and this await cannot hang forever.
+    const abortController = new AbortController();
+    try {
+      const drainPromise = once(stdin, "drain", { signal: abortController.signal }).then(
+        () => "drain" as const,
+      );
+      const closePromise = once(ffmpeg, "close", { signal: abortController.signal }).then(
+        () => "exit" as const,
+      );
+      const racePromise = Promise.race([drainPromise, closePromise]).catch((err: unknown) => {
+        if (err instanceof Error && err.name === "AbortError") {
+          return "exit" as const;
+        }
+        throw err;
+      });
+
+      if (exitStatus !== "running") {
+        return "exit";
+      }
+
+      return await racePromise;
+    } finally {
+      abortController.abort();
     }
-  }, streamingTimeout);
+  };
 
   const encoder: StreamingEncoder = {
-    writeFrame: (buffer: Buffer): boolean => {
-      if (exitStatus !== "running" || !ffmpeg.stdin || ffmpeg.stdin.destroyed) {
+    writeFrame: async (buffer: Buffer): Promise<boolean> => {
+      const stdin = ffmpeg.stdin;
+      if (exitStatus !== "running" || !stdin || stdin.destroyed) {
         return false;
       }
       // Copy the buffer before writing — Node streams hold a reference to the
       // provided buffer and drain it asynchronously. The HDR path's compositor
       // reuses pre-allocated transOutput/normalCanvas buffers across frames,
       // so without this copy the pipe would read partially-overwritten data
-      // and flicker. The SDR path doesn't invoke writeFrame at all (it pipes
-      // PNG files via encodeFramesFromDir), so the memcpy here is HDR-only
-      // and justified by correctness.
+      // and flicker.
       const copy = Buffer.from(buffer);
-      return ffmpeg.stdin.write(copy);
+      const accepted = stdin.write(copy);
+      // Reset inactivity timer immediately ONLY on `accepted === true`. `true`
+      // means the write went through to the kernel pipe without buffering in
+      // Node — proof FFmpeg is actually consuming. `false` means Node's writable
+      // stream had to buffer (FFmpeg hasn't drained the pipe yet); we await
+      // `drain` before letting callers produce the next frame, and only reset
+      // after drain proves consumption. We deliberately don't reset before
+      // drain so a hung FFmpeg with a still-producing Chrome can't keep us
+      // alive forever while Node's stdin buffer grows to OOM. If FFmpeg exits
+      // before draining, waitForDrainOrExit returns "exit", removes its
+      // one-shot listeners, and callers see `false` instead of hanging.
+      if (accepted) {
+        resetTimer();
+        return true;
+      }
+
+      const drainResult = await waitForDrainOrExit(stdin);
+      if (drainResult !== "drain" || exitStatus !== "running") {
+        return false;
+      }
+      resetTimer();
+      return true;
     },
 
     close: async (): Promise<StreamingEncoderResult> => {
@@ -442,7 +566,10 @@ export async function spawnStreamingEncoder(
       // repeated calls. If you change this method, preserve idempotency or
       // a regression here will silently double-close ffmpeg and produce
       // harder-to-trace errors at the orchestrator layer.
-      clearTimeout(timer);
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
       if (signal) signal.removeEventListener("abort", onAbort);
 
       const stdin = ffmpeg.stdin;
@@ -480,6 +607,11 @@ export async function spawnStreamingEncoder(
     },
 
     getExitStatus: () => exitStatus,
+
+    getExitError: () => {
+      if (exitStatus !== "error") return undefined;
+      return formatFfmpegError(exitCode, stderr);
+    },
   };
 
   return encoder;

@@ -15,7 +15,10 @@ import { join } from "node:path";
 import { extractHtml } from "./htmlExtractor.js";
 // captureScreenshots removed — full-page screenshot replaces per-section shots
 import { extractTokens } from "./tokenExtractor.js";
+import { extractDesignStyles } from "./designStyleExtractor.js";
 import { downloadAssets, downloadAndRewriteFonts } from "./assetDownloader.js";
+import { extractFontMetadata } from "./fontMetadataExtractor.js";
+import { normalizeErrorMessage } from "../utils/errorMessage.js";
 // briefGenerator.ts, visual-style, capture-summary removed — DESIGN.md replaces them
 import {
   setupAnimationCapture,
@@ -39,6 +42,7 @@ import type { CaptureOptions, CaptureResult } from "./types.js";
 
 export type { CaptureOptions, CaptureResult } from "./types.js";
 
+// fallow-ignore-next-line complexity
 export async function captureWebsite(
   opts: CaptureOptions,
   onProgress?: (stage: string, detail?: string) => void,
@@ -139,9 +143,18 @@ export async function captureWebsite(
 
     // Intercept network responses to detect Lottie JSON files
     const discoveredLotties: DiscoveredLottie[] = [];
+    // Layer 1 (passive video discovery): every direct-video URL the page fetches
+    // over the whole session (load / scroll / carousel rotation), independent of
+    // whether a <video> for it exists at snapshot time. captureVideoManifest
+    // downloads these (guarded) and merges them into the manifest.
+    const discoveredVideoUrls = new Set<string>();
+    // fallow-ignore-next-line complexity
     page1.on("response", async (response) => {
       try {
         const responseUrl = response.url();
+        if (/\.(mp4|webm|mov|m4v)(\?|#|$)/i.test(responseUrl)) {
+          discoveredVideoUrls.add(responseUrl);
+        }
         const contentType = response.headers()["content-type"] || "";
         const isJsonUrl = responseUrl.endsWith(".json");
         const isLottieUrl = responseUrl.endsWith(".lottie");
@@ -316,11 +329,36 @@ export async function captureWebsite(
     // Extract design tokens
     progress("tokens", "Extracting design tokens...");
     const tokens = await extractTokens(page1);
+    // Save tokens.json without SVG outerHTML (kept in memory for asset downloader)
+    const tokensForDisk = {
+      ...tokens,
+      svgs: tokens.svgs.map(({ outerHTML: _, ...rest }) => rest),
+    };
     writeFileSync(
       join(outputDir, "extracted", "tokens.json"),
-      JSON.stringify(tokens, null, 2),
+      JSON.stringify(tokensForDisk, null, 2),
       "utf-8",
     );
+
+    // Extract computed design styles (typography, buttons, cards, spacing, shadows)
+    progress("style", "Extracting design styles...");
+    try {
+      const designStyles = await extractDesignStyles(page1);
+      writeFileSync(
+        join(outputDir, "extracted", "design-styles.json"),
+        JSON.stringify(designStyles, null, 2),
+        "utf-8",
+      );
+      progress(
+        "tokens",
+        `${designStyles.typography.length} typography roles, ${designStyles.buttons.length} button styles, ${designStyles.shadows.length} shadow values extracted`,
+      );
+    } catch (err) {
+      const errMsg =
+        err instanceof Error ? `${err.message}\n${err.stack}` : normalizeErrorMessage(err);
+      console.error(`  ⚠ Design style extraction failed: ${errMsg}`);
+      warnings.push(`Design style extraction failed: ${errMsg}`);
+    }
 
     // Collect animation catalog
     progress("animations", "Cataloging animations...");
@@ -364,6 +402,7 @@ export async function captureWebsite(
     // Remove Next.js bootstrap scripts individually (match each script tag separately)
     extracted.bodyHtml = extracted.bodyHtml.replace(
       /<script\b[^>]*>([\s\S]*?)<\/script>/gi,
+      // fallow-ignore-next-line complexity
       (match: string, content: string) => {
         // Only remove if this specific script contains Next.js bootstrap code
         if (
@@ -397,7 +436,10 @@ export async function captureWebsite(
     // Generate video manifest — screenshot each <video> element + extract surrounding context
     // so Claude Code can SEE what each video shows and WHERE it was used on the page.
     try {
-      await captureVideoManifest(page1, outputDir, progress);
+      await captureVideoManifest(page1, outputDir, progress, {
+        networkVideoUrls: discoveredVideoUrls, // Layer 1 (live Set, read after sampling)
+        sampleMs: 12000, // Layer 2: poll DOM ≤12s so auto-rotating carousels reveal each slide
+      });
     } catch {
       /* non-blocking — video manifest is best-effort */
     }
@@ -418,6 +460,30 @@ export async function captureWebsite(
 
     // Download fonts and rewrite URLs to local paths
     extracted.headHtml = await downloadAndRewriteFonts(extracted.headHtml, outputDir);
+
+    // Identify each downloaded font by reading its OpenType name table.
+    // Modern frameworks hash font filenames; this manifest tells the
+    // downstream pipeline (DESIGN.md authoring, beat sub-agents) which file
+    // belongs to which family without guessing from filename patterns.
+    try {
+      const fontsManifest = extractFontMetadata(
+        join(outputDir, "assets", "fonts"),
+        join(outputDir, "extracted", "fonts-manifest.json"),
+      );
+      if (fontsManifest.families.length > 0) {
+        const summary = fontsManifest.families
+          .map((f) => `${f.family}${f.variable ? " (variable)" : ""} × ${f.fileCount}`)
+          .join(", ");
+        console.log(`Font metadata extracted: ${summary}`);
+        if (fontsManifest.unidentified.length > 0) {
+          console.warn(
+            `  ${fontsManifest.unidentified.length} font file(s) could not be identified — DESIGN.md should flag these explicitly.`,
+          );
+        }
+      }
+    } catch (err) {
+      console.warn("Font metadata extraction failed (non-fatal):", normalizeErrorMessage(err));
+    }
 
     // Save animation catalog — lean version for the agent (not 745 raw CSS declarations)
     if (animationCatalog) {
@@ -453,28 +519,55 @@ export async function captureWebsite(
       assets = await downloadAssets(tokens, outputDir, catalogedAssets, faviconLinks);
     }
 
+    // Join in-section media URLs → downloaded local paths, then re-write
+    // tokens.json. Downstream page recreation MUST reference local files:
+    // remote URLs fail at render time (hotlink/CORS 403, no egress in
+    // Docker/Lambda, frame-timing blanks for not-yet-loaded images).
+    if (assets.length && Array.isArray(tokens.sections)) {
+      const base = (u: string): string => u.split(/[#?]/)[0] ?? u;
+      const localByUrl = new Map<string, string>();
+      for (const a of assets) {
+        if (!a.url || !a.localPath) continue;
+        localByUrl.set(a.url, a.localPath);
+        localByUrl.set(base(a.url), a.localPath);
+      }
+      for (const sec of tokens.sections) {
+        const local: string[] = [];
+        for (const u of sec.assetUrls || []) {
+          const hit = localByUrl.get(u) || localByUrl.get(base(u));
+          if (hit && !local.includes(hit)) local.push(hit);
+        }
+        if (local.length) sec.assets = local;
+      }
+      const tokensForDisk2 = {
+        ...tokens,
+        svgs: tokens.svgs.map(({ outerHTML: _, ...rest }) => rest),
+      };
+      writeFileSync(
+        join(outputDir, "extracted", "tokens.json"),
+        JSON.stringify(tokensForDisk2, null, 2),
+        "utf-8",
+      );
+    }
+
+    // Persist a self-contained page recreation (extracted/page.html) as the
+    // high-fidelity structural reference for the page-card rebuild. NOT a
+    // composition — kept under extracted/ so the producer (which discovers
+    // compositions by index.html) never picks it up. Images are already inlined
+    // as data URLs by extractHtml, so it renders standalone.
+    try {
+      const pageHtml = `<!doctype html>\n<html ${extracted.htmlAttrs || ""}>\n<head>\n${extracted.headHtml}\n</head>\n<body>\n${extracted.bodyHtml}\n</body>\n</html>\n`;
+      writeFileSync(join(outputDir, "extracted", "page.html"), pageHtml, "utf-8");
+    } catch (err) {
+      warnings.push(`page.html write failed: ${err}`);
+    }
+
     // Save visible text content for AI agent to use
     if (visibleTextContent) {
       writeFileSync(join(outputDir, "extracted", "visible-text.txt"), visibleTextContent, "utf-8");
     }
 
-    // Save cataloged assets as JSON for AI agent
-    if (catalogedAssets.length > 0) {
-      writeFileSync(
-        join(outputDir, "extracted", "assets-catalog.json"),
-        JSON.stringify(catalogedAssets, null, 2),
-        "utf-8",
-      );
-    }
-
-    // Save detected libraries
-    if (detectedLibraries.length > 0) {
-      writeFileSync(
-        join(outputDir, "extracted", "detected-libraries.json"),
-        JSON.stringify(detectedLibraries, null, 2),
-        "utf-8",
-      );
-    }
+    // detected-libraries and assets-catalog removed — 0/8 agents read them in v6 testing
 
     // AI-powered image captioning via Gemini (optional — enriches asset descriptions)
     const geminiCaptions = await captionImagesWithGemini(outputDir, progress, warnings);
@@ -485,20 +578,71 @@ export async function captureWebsite(
       const lines = generateAssetDescriptions(outputDir, tokens, catalogedAssets, geminiCaptions);
 
       if (lines.length > 0) {
+        const hasGeminiKey = !!(process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY);
+        const header = hasGeminiKey
+          ? "# Asset Descriptions\n\nOne line per file. Read this instead of opening every image individually.\n\nTo find a specific brand or icon, **grep this file for the brand name in the description text** (e.g. `grep -i 'autodesk' asset-descriptions.md`). The Gemini Vision captions identify what's actually in each file — that's the agent's selector.\n\nThe `logo-<hash>.svg` filename prefix is a cheap structural hint (DOM said this SVG was inside a `<header>`, home-link `<a>`, or had an aria-label matching the page brand). It is NOT a content claim — many `logo-*` files are nav icons or decorative shapes. Trust the captions, not the filename prefix.\n\n"
+          : "# Asset Descriptions\n\n⚠️  GEMINI_API_KEY not set — descriptions below are catalog-derived (alt text, headings, section context, filename) instead of Vision-generated. To get richer Vision descriptions on the next capture, set GEMINI_API_KEY (or GOOGLE_API_KEY) and re-run.\n\nThe `logo-<hash>.svg` filename prefix is a structural hint (DOM said this SVG was inside a `<header>`, home-link `<a>`, or had an aria-label matching the page brand). To pick the actual brand logo without Vision, open the `logo-*` candidates in a previewer or rasterize them with `sharp` before referencing — composing a fake logo ships off-brand in the final video.\n\n";
         writeFileSync(
           join(outputDir, "extracted", "asset-descriptions.md"),
-          "# Asset Descriptions\n\nOne line per file. Read this instead of opening every image individually.\n\n" +
-            lines.map((l) => "- " + l).join("\n") +
-            "\n",
+          header + lines.map((l) => "- " + l).join("\n") + "\n",
           "utf-8",
         );
-        progress("design", `${lines.length} asset descriptions written`);
+        progress(
+          "design",
+          `${lines.length} asset descriptions written${hasGeminiKey ? "" : " (no Gemini key — catalog-fallback mode)"}`,
+        );
       }
     } catch {
       /* non-critical */
     }
 
     progress("design", "DESIGN.md will be created by your AI agent");
+
+    // Generate contact sheets (saves AI agents 50-65% tokens vs reading images individually)
+    // All functions return string[] — paginated so every image is covered
+    try {
+      const { createScrollContactSheet, createAssetContactSheet, createSvgContactSheet } =
+        await import("./contactSheet.js");
+
+      const scrollSheets = await createScrollContactSheet(
+        join(outputDir, "screenshots"),
+        join(outputDir, "screenshots", "contact-sheet.jpg"),
+      );
+      if (scrollSheets.length > 0)
+        progress(
+          "design",
+          `Screenshot contact sheet generated (${scrollSheets.length} page${scrollSheets.length > 1 ? "s" : ""})`,
+        );
+
+      const assetsImgDir = join(outputDir, "assets");
+      if (existsSync(assetsImgDir)) {
+        const assetSheets = await createAssetContactSheet(
+          assetsImgDir,
+          join(outputDir, "assets", "contact-sheet.jpg"),
+        );
+        if (assetSheets.length > 0)
+          progress(
+            "design",
+            `Asset contact sheet generated (${assetSheets.length} page${assetSheets.length > 1 ? "s" : ""})`,
+          );
+      }
+
+      // Scan assets/svgs/ (inline SVGs) AND assets/ root (external SVGs from <img src="*.svg">)
+      // so sites like huly.io that only use external SVGs still get a grid
+      const svgsDir = join(outputDir, "assets", "svgs");
+      const assetsRootDir = join(outputDir, "assets");
+      const svgOutputPath = existsSync(svgsDir)
+        ? join(outputDir, "assets", "svgs", "contact-sheet.jpg")
+        : join(outputDir, "assets", "contact-sheet-svgs.jpg");
+      const svgSheets = await createSvgContactSheet(svgsDir, svgOutputPath, assetsRootDir);
+      if (svgSheets.length > 0)
+        progress(
+          "design",
+          `SVG contact sheet generated (${svgSheets.length} page${svgSheets.length > 1 ? "s" : ""})`,
+        );
+    } catch {
+      /* contact sheets are non-critical — agent can still read images individually */
+    }
 
     // Generate project scaffold (index.html, meta.json, CLAUDE.md)
     await generateProjectScaffold(

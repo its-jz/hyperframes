@@ -1,5 +1,13 @@
 import { describe, it, expect } from "vitest";
-import { isFontResourceError } from "./frameCapture.js";
+import {
+  formatHttpErrorDiagnostic,
+  formatConsoleDiagnostic,
+  formatNavigationFailureDiagnostic,
+  formatNavigationStartDiagnostic,
+  formatRequestFailureDiagnostic,
+  isFontResourceError,
+  sanitizeDiagnosticUrl,
+} from "./frameCapture.js";
 
 describe("isFontResourceError", () => {
   it("matches Google Fonts CSS load failures via location.url", () => {
@@ -108,5 +116,109 @@ describe("isFontResourceError", () => {
     expect(
       isFontResourceError("error", "Failed to load resource: 404", "http://example.com/FONT.WOFF2"),
     ).toBe(true);
+  });
+});
+
+describe("formatConsoleDiagnostic", () => {
+  it("surfaces HyperFrames page logs with a dedicated host prefix", () => {
+    expect(
+      formatConsoleDiagnostic("info", "[hyperframes] render runtime fps JSHandle@object", ""),
+    ).toEqual({
+      text: "[HyperFrames] render runtime fps JSHandle@object",
+      suppressHostLog: false,
+    });
+  });
+
+  it("keeps font load errors in diagnostics but suppresses host log noise", () => {
+    expect(
+      formatConsoleDiagnostic(
+        "error",
+        "Failed to load resource: net::ERR_FAILED",
+        "https://fonts.googleapis.com/css2?family=Inter",
+      ),
+    ).toEqual({
+      text: "[Browser] Failed to load resource: net::ERR_FAILED",
+      suppressHostLog: true,
+    });
+  });
+
+  it("preserves existing browser prefixes for generic logs", () => {
+    expect(formatConsoleDiagnostic("warn", "careful", "")).toEqual({
+      text: "[Browser:WARN] careful",
+      suppressHostLog: false,
+    });
+  });
+});
+
+describe("navigation diagnostics", () => {
+  it("redacts credentials, query strings, and fragments from diagnostic URLs", () => {
+    expect(
+      sanitizeDiagnosticUrl("https://user:pass@example.com/assets/video.mp4?token=secret#frag"),
+    ).toBe("https://example.com/assets/video.mp4");
+  });
+
+  it("redacts data and blob URLs", () => {
+    expect(sanitizeDiagnosticUrl("data:image/png;base64,abc123")).toBe("data:<redacted>");
+    expect(sanitizeDiagnosticUrl("blob:https://example.com/abc123")).toBe("blob:<redacted>");
+  });
+
+  it("redacts query strings from relative URLs", () => {
+    expect(sanitizeDiagnosticUrl("/relative/path.png?token=secret#frag")).toBe(
+      "/relative/path.png",
+    );
+  });
+
+  it("formats page.goto failures with mode, timeout, elapsed time, and sanitized URL", () => {
+    const diagnostic = formatNavigationFailureDiagnostic({
+      captureMode: "screenshot",
+      url: "http://127.0.0.1:4173/index.html?claim_token=secret",
+      timeoutMs: 60_000,
+      elapsedMs: 60_123,
+      error: new Error("Navigation timeout of 60000 ms exceeded"),
+    });
+
+    expect(diagnostic).toContain("[FrameCapture:ERROR] page.goto failed");
+    expect(diagnostic).toContain("mode=screenshot");
+    expect(diagnostic).toContain("timeoutMs=60000");
+    expect(diagnostic).toContain("elapsedMs=60123");
+    expect(diagnostic).toContain("url=http://127.0.0.1:4173/index.html");
+    expect(diagnostic).not.toContain("claim_token");
+  });
+
+  it("formats page.goto starts with mode, timeout, and sanitized URL", () => {
+    const diagnostic = formatNavigationStartDiagnostic({
+      captureMode: "screenshot",
+      url: "http://127.0.0.1:4173/index.html?claim_token=secret",
+      timeoutMs: 60_000,
+    });
+
+    expect(diagnostic).toContain("[FrameCapture:NAV] page.goto start");
+    expect(diagnostic).toContain("mode=screenshot");
+    expect(diagnostic).toContain("timeoutMs=60000");
+    expect(diagnostic).toContain("url=http://127.0.0.1:4173/index.html");
+    expect(diagnostic).not.toContain("claim_token");
+  });
+
+  it("formats request and HTTP failures with sanitized URLs", () => {
+    expect(
+      formatRequestFailureDiagnostic({
+        method: "GET",
+        resourceType: "media",
+        url: "https://cdn.example.com/video.mp4?token=secret",
+        failureText: "net::ERR_FAILED",
+      }),
+    ).toBe(
+      "[Browser:REQUESTFAILED] GET https://cdn.example.com/video.mp4 resource=media error=net::ERR_FAILED",
+    );
+
+    expect(
+      formatHttpErrorDiagnostic({
+        method: "GET",
+        resourceType: "image",
+        url: "https://cdn.example.com/frame.png?token=secret",
+        status: 403,
+        statusText: "Forbidden",
+      }),
+    ).toBe("[Browser:HTTP403] GET https://cdn.example.com/frame.png resource=image Forbidden");
   });
 });

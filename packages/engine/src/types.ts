@@ -4,6 +4,7 @@
  * The engine's page contract. Any web page that wants to be rendered
  * as video must expose `window.__hf` implementing the HfProtocol interface.
  */
+import type { Fps } from "@hyperframes/core";
 
 // ── Seek Protocol ──────────────────────────────────────────────────────────────
 
@@ -44,8 +45,8 @@ export interface HfTransitionMeta {
   time: number;
   /** Transition duration (seconds) */
   duration: number;
-  /** Shader identifier (e.g. "fade", "wipe") */
-  shader: string;
+  /** Shader identifier. Undefined when the transition is a CSS crossfade. */
+  shader?: string;
   /** GSAP easing string (e.g. "power2.inOut") */
   ease: string;
   /** Scene id the transition starts from */
@@ -81,10 +82,24 @@ export interface HfProtocol {
 export interface CaptureOptions {
   width: number;
   height: number;
-  fps: number;
+  /**
+   * Frame rate as an exact rational. Integer fps is `{ num: 30, den: 1 }`;
+   * NTSC is `{ num: 30000, den: 1001 }`. Captures are scheduled by the
+   * decimal interval (1000 * den / num ms) but FFmpeg arg builders emit the
+   * rational form verbatim — see `fpsToFfmpegArg`.
+   */
+  fps: Fps;
   format?: "jpeg" | "png";
   quality?: number;
   deviceScaleFactor?: number;
+  /**
+   * Opt into Chrome's capture-beyond-viewport screenshot path. Leave undefined
+   * to let the engine pick the safe browser-specific default. Pass false only
+   * when the caller explicitly wants Chrome's faster viewport-bound path.
+   * Enable for known compositor edge cases such as native video surfaces in
+   * tall portrait renders.
+   */
+  captureBeyondViewport?: boolean;
   /**
    * FFmpeg-probed intrinsic dimensions for videos whose frames are injected
    * out-of-band. Applied before the readiness wait so layout that depends on
@@ -113,6 +128,20 @@ export interface CaptureOptions {
    * `--variables-file <path>`. Must be a JSON-serializable plain object.
    */
   variables?: Record<string, unknown>;
+  /**
+   * When `true`, the BeginFrame warmup loop driven during page navigation
+   * runs exactly `LOCKED_WARMUP_TICKS` (60) iterations regardless of how
+   * long the page load takes, making `session.beginFrameTimeTicks`
+   * deterministic across machines with different page-load latencies.
+   *
+   * Default `false`: wall-clock-bounded driver — ticks until page-readiness
+   * completes, accumulating whatever count the host CPU manages. Preserves
+   * the in-process renderer's BeginFrame timing baselines.
+   *
+   * Has no effect outside BeginFrame mode (screenshot capture never runs a
+   * warmup loop).
+   */
+  lockWarmupTicks?: boolean;
 }
 
 export interface CaptureVideoMetadataHint {
@@ -139,6 +168,26 @@ export interface CapturePerfSummary {
   avgSeekMs: number;
   avgBeforeCaptureMs: number;
   avgScreenshotMs: number;
+  /**
+   * Frames served from the static-dedup cache instead of a real seek+screenshot
+   * (opt-out HF_STATIC_DEDUP=false). 0 when dedup was off or never armed. NOT counted
+   * in `frames` (reuses are excluded so they don't dilute the per-frame
+   * averages) — the captured total this session is `frames + staticDedupReused`.
+   */
+  staticDedupReused: number;
+  /** `HF_STATIC_DEDUP=true` was set for this render (adoption signal). */
+  staticDedupEnabled: boolean;
+  /** Dedup passed every gate + verification and was active. */
+  staticDedupArmed: boolean;
+  /** Predicted reusable frame count when armed; 0 otherwise. */
+  staticDedupPredicted: number;
+  /**
+   * Low-cardinality reason dedup did not arm: `capture_mode` | `video_injection`
+   * | `page_composite` | `ineligible` | `verification_failed` | `verification_budget`.
+   * Undefined when armed or when dedup was disabled. (Render-level aggregation may
+   * `|`-join distinct reasons when parallel workers diverge.)
+   */
+  staticDedupSkipReason?: string;
 }
 
 // ── Global Augmentation ────────────────────────────────────────────────────────

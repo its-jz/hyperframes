@@ -146,6 +146,25 @@ function createFrameSourceCache(
 
 export const __testing = { createFrameSourceCache };
 
+async function redrawRuntimeColorGrading(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const hf = (
+      window as Window & {
+        __hf?: {
+          colorGrading?: { redraw?: () => unknown };
+        };
+      }
+    ).__hf;
+    const redraw = hf?.colorGrading?.redraw;
+    if (typeof redraw !== "function") return;
+    try {
+      redraw();
+    } catch {
+      // Optional page-side shader layer.
+    }
+  });
+}
+
 /**
  * Creates a BeforeCaptureHook that injects pre-extracted video frames
  * into the page, replacing native <video> elements with frame images.
@@ -197,14 +216,36 @@ export function createVideoFrameInjector(
 
     await syncVideoFrameVisibility(page, Array.from(activeIds));
     if (updates.length > 0) {
-      await injectVideoFramesBatch(
-        page,
-        updates.map((u) => ({ videoId: u.videoId, dataUri: u.dataUri })),
+      // Only record cache entries for videos the page actually painted.
+      // injectVideoFramesBatch skips any video whose visual ancestor is
+      // hidden (sub-comp host out-of-window) and returns the subset of ids
+      // it really wrote — recording the rest would short-circuit the next
+      // call at the same frameIndex and leave the host's first visible
+      // frame blank.
+      const injectedIds = new Set(
+        await injectVideoFramesBatch(
+          page,
+          updates.map((u) => ({ videoId: u.videoId, dataUri: u.dataUri })),
+        ),
       );
       for (const update of updates) {
-        lastInjectedFrameByVideo.set(update.videoId, update.frameIndex);
+        if (injectedIds.has(update.videoId)) {
+          lastInjectedFrameByVideo.set(update.videoId, update.frameIndex);
+        }
+      }
+      if (injectedIds.size > 0) {
+        // GPU compositions (WebGL / WebGPU) that sample these videos as
+        // textures already rendered once on the pre-injection seek, reading a
+        // stale/black frame. Now that the decoded `__render_frame__` images are
+        // in the DOM, re-render the GPU adapters at the same time so they
+        // re-upload their video textures from the correct frame. No-op in
+        // compositions without a GPU adapter.
+        await page.evaluate((t: number) => {
+          (window as unknown as { __hfReseekGpu?: (n: number) => void }).__hfReseekGpu?.(t);
+        }, time);
       }
     }
+    await redrawRuntimeColorGrading(page);
   };
 }
 
@@ -525,28 +566,64 @@ export async function queryElementStacking(
         if (!htmlEl) continue;
         mat = mat.translate(htmlEl.offsetLeft, htmlEl.offsetTop);
         const cs = window.getComputedStyle(htmlEl);
-        if (cs.transform && cs.transform !== "none") {
-          const origin = cs.transformOrigin.split(" ");
-          const ox = resolveLength(origin[0] ?? "0", htmlEl.offsetWidth);
-          const oy = resolveLength(origin[1] ?? "0", htmlEl.offsetHeight);
-          try {
-            const t = new DOMMatrix(cs.transform);
-            if (
-              Number.isFinite(t.a) &&
-              Number.isFinite(t.b) &&
-              Number.isFinite(t.c) &&
-              Number.isFinite(t.d) &&
-              Number.isFinite(t.e) &&
-              Number.isFinite(t.f)
-            ) {
-              mat = mat.translate(ox, oy).multiply(t).translate(-ox, -oy);
+        const origin = cs.transformOrigin.split(" ");
+        const ox = resolveLength(origin[0] ?? "0", htmlEl.offsetWidth);
+        const oy = resolveLength(origin[1] ?? "0", htmlEl.offsetHeight);
+        const individualTransform = composeIndividualTransforms(cs);
+        const hasIndividual = individualTransform !== null;
+        const hasTransform = cs.transform && cs.transform !== "none";
+        if (hasIndividual || hasTransform) {
+          mat = mat.translate(ox, oy);
+          if (hasIndividual) mat = mat.multiply(individualTransform);
+          if (hasTransform) {
+            try {
+              const t = new DOMMatrix(cs.transform);
+              if (
+                Number.isFinite(t.a) &&
+                Number.isFinite(t.b) &&
+                Number.isFinite(t.c) &&
+                Number.isFinite(t.d) &&
+                Number.isFinite(t.e) &&
+                Number.isFinite(t.f)
+              ) {
+                mat = mat.multiply(t);
+              }
+            } catch {
+              // DOMMatrix constructor throws on malformed input — skip.
             }
-          } catch {
-            // DOMMatrix constructor throws on malformed input — skip ancestor.
           }
+          mat = mat.translate(-ox, -oy);
         }
       }
       return mat.toString();
+    }
+
+    function composeIndividualTransforms(cs: CSSStyleDeclaration): DOMMatrix | null {
+      const translate = cs.getPropertyValue("translate").trim();
+      const rotate = cs.getPropertyValue("rotate").trim();
+      const scale = cs.getPropertyValue("scale").trim();
+      const hasTranslate = translate && translate !== "none";
+      const hasRotate = rotate && rotate !== "none";
+      const hasScale = scale && scale !== "none";
+      if (!hasTranslate && !hasRotate && !hasScale) return null;
+      let m = new DOMMatrix();
+      if (hasTranslate) {
+        const parts = translate.split(/\s+/);
+        const tx = parseFloat(parts[0] ?? "0") || 0;
+        const ty = parseFloat(parts[1] ?? "0") || 0;
+        if (tx !== 0 || ty !== 0) m = m.translate(tx, ty);
+      }
+      if (hasRotate) {
+        const deg = parseFloat(rotate) || 0;
+        if (deg !== 0) m = m.rotate(deg);
+      }
+      if (hasScale) {
+        const parts = scale.split(/\s+/);
+        const sx = parseFloat(parts[0] ?? "1") || 1;
+        const sy = parseFloat(parts[1] ?? String(sx)) || sx;
+        if (sx !== 1 || sy !== 1) m = m.scale(sx, sy);
+      }
+      return m;
     }
 
     function resolveLength(value: string, basis: number): number {

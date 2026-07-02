@@ -1,5 +1,11 @@
-import { describe, it, expect } from "vitest";
+// @vitest-environment happy-dom
+
+import React, { act } from "react";
+import { createRoot } from "react-dom/client";
+import { afterEach } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
+  Timeline,
   formatTimelineTickLabel,
   generateTicks,
   getDefaultDroppedTrack,
@@ -8,10 +14,97 @@ import {
   getTimelinePlayheadLeft,
   getTimelineScrollLeftForZoomAnchor,
   getTimelineScrollLeftForZoomTransition,
+  shouldShowTimelineShortcutHint,
   shouldHandleTimelineDeleteKey,
   shouldAutoScrollTimeline,
 } from "./Timeline";
+import { RULER_H, TRACK_H } from "./timelineLayout";
 import { formatTime } from "../lib/time";
+import { usePlayerStore } from "../store/playerStore";
+
+globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+
+afterEach(() => {
+  document.body.innerHTML = "";
+  usePlayerStore.getState().reset();
+});
+
+describe("Timeline provider boundary", () => {
+  it("renders the public Timeline export without TimelineEditProvider", () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    Object.defineProperty(host, "clientWidth", {
+      configurable: true,
+      value: 640,
+    });
+
+    usePlayerStore.setState({
+      duration: 4,
+      timelineReady: true,
+      elements: [{ id: "clip-1", tag: "div", start: 0, duration: 2, track: 0 }],
+    });
+
+    const root = createRoot(host);
+
+    expect(() => {
+      act(() => {
+        root.render(React.createElement(Timeline));
+      });
+    }).not.toThrow();
+
+    act(() => root.unmount());
+  });
+
+  it("opens the keyframe context menu without seeking to that keyframe", () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    Object.defineProperty(host, "clientWidth", {
+      configurable: true,
+      value: 720,
+    });
+
+    usePlayerStore.setState({
+      duration: 4,
+      timelineReady: true,
+      currentTime: 0.25,
+      selectedElementId: "clip-1",
+      elements: [{ id: "clip-1", tag: "div", start: 0, duration: 4, track: 0 }],
+      keyframeCache: new Map([
+        [
+          "clip-1",
+          {
+            format: "percentage",
+            keyframes: [{ percentage: 50, properties: { x: 100 }, tweenPercentage: 50 }],
+          },
+        ],
+      ]),
+    });
+
+    const onSeek = vi.fn();
+    const root = createRoot(host);
+    act(() => {
+      root.render(React.createElement(Timeline, { onSeek }));
+    });
+
+    const diamond = host.querySelector<HTMLButtonElement>('button[title="50%"]');
+    expect(diamond).not.toBeNull();
+
+    act(() => {
+      diamond!.dispatchEvent(
+        new MouseEvent("contextmenu", {
+          bubbles: true,
+          cancelable: true,
+          button: 2,
+          clientX: 120,
+          clientY: 40,
+        }),
+      );
+    });
+
+    expect(onSeek).not.toHaveBeenCalled();
+    act(() => root.unmount());
+  });
+});
 
 describe("generateTicks", () => {
   it("returns empty arrays for duration <= 0", () => {
@@ -229,11 +322,22 @@ describe("getTimelinePlayheadLeft", () => {
 
 describe("getTimelineCanvasHeight", () => {
   it("includes bottom scroll buffer below the last track", () => {
-    expect(getTimelineCanvasHeight(3)).toBeGreaterThan(24 + 3 * 72);
+    expect(getTimelineCanvasHeight(3)).toBeGreaterThan(RULER_H + 3 * TRACK_H);
   });
 
   it("still keeps ruler space when there are no tracks", () => {
     expect(getTimelineCanvasHeight(0)).toBeGreaterThan(24);
+  });
+});
+
+describe("shouldShowTimelineShortcutHint", () => {
+  it("shows the hint when the timeline does not vertically overflow", () => {
+    expect(shouldShowTimelineShortcutHint(220, 220)).toBe(true);
+    expect(shouldShowTimelineShortcutHint(220.5, 220)).toBe(true);
+  });
+
+  it("hides the hint when timeline tracks need vertical scrolling", () => {
+    expect(shouldShowTimelineShortcutHint(221.5, 220)).toBe(false);
   });
 });
 

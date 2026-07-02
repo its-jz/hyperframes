@@ -1,4 +1,7 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo } from "react";
+import { trackStudioRenderStart } from "../../telemetry/events";
+import { getAnonymousId } from "../../telemetry/config";
+import { generateId } from "../../utils/generateId";
 
 export interface RenderJob {
   id: string;
@@ -14,8 +17,14 @@ export interface RenderJob {
 // Mirrors `CanvasResolution` from @hyperframes/core. Kept local because
 // studio's tsconfig doesn't include node types, and the core barrel
 // transitively pulls in modules with `node:fs` imports. Drift risk is
-// low (4 string literals tied to a stable enum).
-export type ResolutionPreset = "landscape" | "portrait" | "landscape-4k" | "portrait-4k";
+// low (6 string literals kept in sync manually with CANVAS_DIMENSIONS).
+export type ResolutionPreset =
+  | "landscape"
+  | "portrait"
+  | "landscape-4k"
+  | "portrait-4k"
+  | "square"
+  | "square-4k";
 
 export interface StartRenderOptions {
   fps?: number;
@@ -23,6 +32,8 @@ export interface StartRenderOptions {
   format?: "mp4" | "webm" | "mov";
   /** `"auto"` (default) renders at the composition's authored dimensions. */
   resolution?: ResolutionPreset | "auto";
+  /** Render a specific composition file instead of index.html. */
+  composition?: string;
 }
 
 export function useRenderQueue(projectId: string | null) {
@@ -80,17 +91,38 @@ export function useRenderQueue(projectId: string | null) {
       const quality = opts.quality ?? "standard";
       const format = opts.format ?? "mp4";
       const resolution = opts.resolution;
+      const composition = opts.composition;
+
+      trackStudioRenderStart({
+        fps,
+        quality,
+        format,
+        resolution,
+        composition,
+      });
 
       const startTime = Date.now();
       // "auto" / undefined means "render at the composition's authored size".
       // Omit the field entirely — sending "auto" would trip the route's
       // enum validation set.
-      const body: { fps: number; quality: string; format: string; resolution?: string } = {
+      const body: {
+        fps: number;
+        quality: string;
+        format: string;
+        resolution?: string;
+        composition?: string;
+        telemetryDistinctId: string;
+      } = {
         fps,
         quality,
         format,
+        // So the server-emitted render_complete/render_error is attributed to
+        // this browser user (same id studio_* events use), making the render
+        // funnel joinable. Matches studio_render_start fired just above.
+        telemetryDistinctId: getAnonymousId(),
       };
       if (resolution && resolution !== "auto") body.resolution = resolution;
+      if (composition) body.composition = composition;
       let res: Response;
       try {
         res = await fetch(`/api/projects/${projectId}/render`, {
@@ -100,7 +132,7 @@ export function useRenderQueue(projectId: string | null) {
         });
       } catch {
         const failedJob: RenderJob = {
-          id: crypto.randomUUID(),
+          id: generateId(),
           status: "failed",
           progress: 0,
           error: "Could not reach render server. Use `hyperframes render` from the CLI instead.",
@@ -112,7 +144,7 @@ export function useRenderQueue(projectId: string | null) {
       }
       if (!res.ok) {
         const failedJob: RenderJob = {
-          id: crypto.randomUUID(),
+          id: generateId(),
           status: "failed",
           progress: 0,
           error: `Server error (${res.status}). Check the terminal for details.`,
@@ -213,11 +245,15 @@ export function useRenderQueue(projectId: string | null) {
     };
   }, [projectId]);
 
-  return {
-    jobs,
-    startRender,
-    deleteRender,
-    clearCompleted,
-    isRendering: jobs.some((j) => j.status === "rendering"),
-  };
+  const isRendering = jobs.some((j) => j.status === "rendering");
+  return useMemo(
+    () => ({
+      jobs,
+      isRendering,
+      deleteRender,
+      clearCompleted,
+      startRender: startRender as (options: unknown) => Promise<void>,
+    }),
+    [jobs, isRendering, deleteRender, clearCompleted, startRender],
+  );
 }

@@ -33,11 +33,15 @@ import {
   RenderCancelledError,
   createRenderJob,
   executeRenderJob,
+  type RenderConfig,
 } from "./services/renderOrchestrator.js";
 import { prepareHyperframeLintBody, runHyperframeLint } from "./services/hyperframeLint.js";
+import { startHealthWorker, type HealthWorkerHandle } from "./services/healthWorker.js";
+import { isVideoFrameFormat } from "@hyperframes/engine";
 import { resolveRenderPaths } from "./utils/paths.js";
 import { defaultLogger, type ProducerLogger } from "./logger.js";
 import { Semaphore } from "./utils/semaphore.js";
+import { parseFps, normalizeResolutionFlag, type CanvasResolution } from "@hyperframes/core";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -68,13 +72,27 @@ export interface ServerOptions extends HandlerOptions {
 interface RenderInput {
   projectDir: string;
   outputPath?: string | null;
-  fps: 24 | 30 | 60;
+  fps: import("@hyperframes/core").Fps;
   quality: "draft" | "standard" | "high";
   format?: "mp4" | "webm" | "mov";
+  videoFrameFormat?: RenderConfig["videoFrameFormat"];
   workers?: number;
   useGpu: boolean;
   debug: boolean;
   entryFile?: string;
+  /**
+   * data-composition-variables overrides forwarded into the render config.
+   * Without this the HTTP/server render path silently rendered the
+   * composition's declared defaults, ignoring per-request overrides.
+   */
+  variables?: Record<string, unknown>;
+  /**
+   * Output resolution preset (e.g. `landscape-4k`). Drives the same
+   * `resolveDeviceScaleFactor` supersampling path the local CLI uses — Chrome
+   * renders at a higher devicePixelRatio so the captured screenshot lands at
+   * the requested dimensions. Aspect ratio must match the composition.
+   */
+  outputResolution?: CanvasResolution;
 }
 
 interface PreparedRenderInput {
@@ -82,8 +100,15 @@ interface PreparedRenderInput {
   cleanupProjectDir?: string;
 }
 
-function parseRenderOptions(body: Record<string, unknown>): Omit<RenderInput, "projectDir"> {
-  const fps = ([24, 30, 60].includes(body.fps as number) ? body.fps : 30) as 24 | 30 | 60;
+export function parseRenderOptions(body: Record<string, unknown>): Omit<RenderInput, "projectDir"> {
+  // Accept either a JSON `number` (integer fps) or a JSON `string` (rational
+  // like "30000/1001"). Falls back to 30 fps on parse failure to preserve the
+  // forgiving behaviour the original whitelist had — the producer surfaces a
+  // clearer downstream error if the value is genuinely unusable.
+  const fpsRaw = body.fps;
+  const fpsParse =
+    typeof fpsRaw === "number" || typeof fpsRaw === "string" ? parseFps(fpsRaw) : null;
+  const fps = fpsParse && fpsParse.ok ? fpsParse.value : ({ num: 30, den: 1 } as const);
   const quality = (
     ["draft", "standard", "high"].includes(body.quality as string) ? body.quality : "high"
   ) as "draft" | "standard" | "high";
@@ -104,14 +129,134 @@ function parseRenderOptions(body: Record<string, unknown>): Omit<RenderInput, "p
 
   const format = (
     ["mp4", "webm", "mov"].includes(body.format as string) ? body.format : undefined
-  ) as "mp4" | "webm" | "mov" | undefined;
+  ) as RenderInput["format"];
+  const videoFrameFormat = isVideoFrameFormat(body.videoFrameFormat)
+    ? body.videoFrameFormat
+    : undefined;
 
-  return { outputPath, fps, quality, workers, useGpu, debug, entryFile, format };
+  const { variables, outputResolution } = parseRenderOverrides(body);
+
+  return {
+    outputPath,
+    fps,
+    quality,
+    workers,
+    useGpu,
+    debug,
+    entryFile,
+    format,
+    variables,
+    outputResolution,
+    videoFrameFormat,
+  };
 }
 
-async function prepareRenderBody(
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Parse the lenient form of the variable + resolution overrides used by
+ * `parseRenderOptions`. Invalid shapes coerce to `undefined` here;
+ * `validateRenderOverrides` separately rejects explicitly-supplied bad values
+ * with a 400 so they aren't silently ignored.
+ */
+function parseRenderOverrides(body: Record<string, unknown>): {
+  variables?: Record<string, unknown>;
+  outputResolution?: CanvasResolution;
+} {
+  // Only forward a plain JSON object. Arrays / primitives / null → undefined.
+  const variables = isPlainObject(body.variables) ? body.variables : undefined;
+  // Accept canonical presets and aliases ("4k", "landscape-4k", …).
+  const outputResolution =
+    typeof body.outputResolution === "string"
+      ? normalizeResolutionFlag(body.outputResolution)
+      : undefined;
+  return { variables, outputResolution };
+}
+
+/**
+ * Build the `createRenderJob` config from a prepared render input. Shared by
+ * the sync (`render`) and streaming (`render-stream`) handlers so the field
+ * set — including `variables` and `outputResolution` — stays in one place.
+ */
+function buildRenderJobConfig(input: RenderInput, log: ProducerLogger) {
+  return {
+    fps: input.fps,
+    quality: input.quality,
+    format: input.format,
+    workers: input.workers,
+    useGpu: input.useGpu,
+    debug: input.debug,
+    entryFile: input.entryFile,
+    variables: input.variables,
+    outputResolution: input.outputResolution,
+    videoFrameFormat: input.videoFrameFormat,
+    logger: log,
+  };
+}
+
+/**
+ * Resolve the destination path for a prepared render and ensure its parent
+ * directory exists. Shared by the sync + streaming handlers (their only
+ * difference is how a `prepareRenderBody` error is surfaced — JSON vs SSE —
+ * which stays in each handler).
+ */
+function resolvePreparedRenderOutput(
+  prepared: PreparedRenderInput,
+  rendersDir: string,
+  log: ProducerLogger,
+): { input: RenderInput; cleanupProjectDir?: string; absoluteOutputPath: string } {
+  const { input, cleanupProjectDir } = prepared;
+  const absoluteOutputPath = resolveOutputPath(input.projectDir, input.outputPath, rendersDir, log);
+  const outputDir = dirname(absoluteOutputPath);
+  if (!existsSync(outputDir)) mkdirSync(outputDir, { recursive: true });
+  return { input, cleanupProjectDir, absoluteOutputPath };
+}
+
+/**
+ * Validate explicitly-supplied render overrides that can't be sanely coerced.
+ * Returns an error string for a clean 400, or `undefined` when the body is
+ * acceptable (including when the fields are simply absent).
+ */
+function validateRenderOverrides(body: Record<string, unknown>): string | undefined {
+  if (body.variables !== undefined && !isPlainObject(body.variables)) {
+    return 'variables must be a JSON object keyed by variable id (e.g. {"title":"Hello"})';
+  }
+  return validateOutputResolutionOverride(body);
+}
+
+/**
+ * Validate an explicitly-supplied `outputResolution`. Rejects (a) non-string
+ * values, which parseRenderOverrides would otherwise silently coerce to
+ * `undefined`; (b) unknown presets; and (c) the alpha-format combination —
+ * outputResolution drives deviceScaleFactor supersampling, which the webm/mov
+ * capture path can't apply (resolveDeviceScaleFactor throws mid-render), so we
+ * reject it here for a clean 400 regardless of which caller sent it.
+ */
+function validateOutputResolutionOverride(body: Record<string, unknown>): string | undefined {
+  if (body.outputResolution === undefined) return undefined;
+  if (typeof body.outputResolution !== "string") {
+    return 'outputResolution must be a string preset (e.g. "4k", "landscape-4k")';
+  }
+  const normalized = normalizeResolutionFlag(body.outputResolution);
+  if (body.outputResolution.trim().length > 0 && normalized === undefined) {
+    return `Invalid outputResolution "${body.outputResolution}". Must be one of: landscape, portrait, landscape-4k, portrait-4k, square, square-4k (aliases: 1080p, 4k, …).`;
+  }
+  if (normalized !== undefined && (body.format === "webm" || body.format === "mov")) {
+    return `outputResolution is not supported with format "${body.format}" — the alpha (webm/mov) capture path can't supersample. Use format "mp4", or omit outputResolution to render at the composition's native dimensions.`;
+  }
+  return undefined;
+}
+
+export async function prepareRenderBody(
   body: Record<string, unknown>,
 ): Promise<{ prepared: PreparedRenderInput } | { error: string }> {
+  // Reject explicitly-supplied-but-malformed overrides up front so the caller
+  // gets a clear 400 instead of a silently-ignored value.
+  const overrideError = validateRenderOverrides(body);
+  if (overrideError) return { error: overrideError };
+
   const options = parseRenderOptions(body);
   const projectDir = typeof body.projectDir === "string" ? body.projectDir : undefined;
   if (projectDir) {
@@ -280,7 +425,7 @@ export function createRenderHandlers(options: HandlerOptions = {}): RenderHandle
       return c.json({ success: false, requestId, error: preparedResult.error }, 400);
     }
 
-    const result = runHyperframeLint(preparedResult.prepared);
+    const result = await runHyperframeLint(preparedResult.prepared);
     log.info("lint completed", {
       requestId,
       entryFile: preparedResult.prepared.entryFile,
@@ -314,15 +459,11 @@ export function createRenderHandlers(options: HandlerOptions = {}): RenderHandle
       return c.json({ success: false, requestId, error: preparedResult.error }, 400);
     }
 
-    const { input, cleanupProjectDir } = preparedResult.prepared;
-    const absoluteOutputPath = resolveOutputPath(
-      input.projectDir,
-      input.outputPath,
+    const { input, cleanupProjectDir, absoluteOutputPath } = resolvePreparedRenderOutput(
+      preparedResult.prepared,
       rendersDir,
       log,
     );
-    const outputDir = dirname(absoluteOutputPath);
-    if (!existsSync(outputDir)) mkdirSync(outputDir, { recursive: true });
 
     const release = await renderSemaphore.acquire();
 
@@ -333,16 +474,7 @@ export function createRenderHandlers(options: HandlerOptions = {}): RenderHandle
       quality: input.quality,
     });
 
-    const job = createRenderJob({
-      fps: input.fps,
-      quality: input.quality,
-      format: input.format,
-      workers: input.workers,
-      useGpu: input.useGpu,
-      debug: input.debug,
-      entryFile: input.entryFile,
-      logger: log,
-    });
+    const job = createRenderJob(buildRenderJobConfig(input, log));
 
     let lastLoggedPct = -10;
     try {
@@ -435,28 +567,15 @@ export function createRenderHandlers(options: HandlerOptions = {}): RenderHandle
         return;
       }
 
-      const { input, cleanupProjectDir } = preparedResult.prepared;
-      const absoluteOutputPath = resolveOutputPath(
-        input.projectDir,
-        input.outputPath,
+      const { input, cleanupProjectDir, absoluteOutputPath } = resolvePreparedRenderOutput(
+        preparedResult.prepared,
         rendersDir,
         log,
       );
-      const outputDir = dirname(absoluteOutputPath);
-      if (!existsSync(outputDir)) mkdirSync(outputDir, { recursive: true });
 
       log.info("render-stream started", { requestId, projectDir: input.projectDir });
 
-      const job = createRenderJob({
-        fps: input.fps,
-        quality: input.quality,
-        format: input.format,
-        workers: input.workers,
-        useGpu: input.useGpu,
-        debug: input.debug,
-        entryFile: input.entryFile,
-        logger: log,
-      });
+      const job = createRenderJob(buildRenderJobConfig(input, log));
       const abortController = new AbortController();
       const onRequestAbort = () =>
         abortController.abort(new RenderCancelledError("request_aborted"));
@@ -620,8 +739,47 @@ export function startServer(options: ServerOptions = {}) {
   (server as unknown as import("node:http").Server).requestTimeout = 0;
   (server as unknown as import("node:http").Server).keepAliveTimeout = 0;
 
-  function shutdown(signal: string) {
+  // Start the worker-thread health endpoint alongside the main listener.
+  // The main thread keeps serving /health on `port` for backwards
+  // compatibility; the worker thread additionally serves /health on
+  // PRODUCER_HEALTH_PORT (default 9848) so k8s liveness/readiness probes can
+  // migrate to a listener that doesn't share an event loop with renders.
+  //
+  // Opt-out: set PRODUCER_DISABLE_HEALTH_WORKER=1 (e.g. for tests that don't
+  // want a worker spawned, or for environments where the extra port isn't
+  // wanted).
+  //
+  // We store the *promise* (not the resolved handle) so a SIGTERM that
+  // arrives before the worker has finished booting still has something to
+  // await. Awaiting a `let healthWorker = null` mutated from inside `.then`
+  // would race: if SIGTERM lands before the `.then` callback fires,
+  // `shutdown()` sees `null` and skips worker cleanup. The promise pattern
+  // closes that window without making startup blocking.
+  const healthWorkerPromise: Promise<HealthWorkerHandle | null> =
+    process.env.PRODUCER_DISABLE_HEALTH_WORKER === "1"
+      ? Promise.resolve(null)
+      : startHealthWorker({ logger: log }).catch((err: Error) => {
+          // Don't crash the producer if the worker fails to start — the main
+          // /health is still up. Log loudly so the operator notices.
+          log.error(`[server] health worker failed to start: ${err.message}`);
+          return null;
+        });
+
+  async function shutdown(signal: string) {
     log.info(`Received ${signal}, shutting down`);
+    const { drainBrowserPool } = await import("@hyperframes/engine");
+    await drainBrowserPool().catch(() => {});
+    // Bounded await: if the worker hasn't come online within 1.5s of
+    // shutdown there's no useful cleanup left to do — `worker.terminate()`
+    // from process exit will kill the thread regardless, and we'd rather
+    // not let a hung-startup worker keep the SIGTERM path waiting.
+    const handle = await Promise.race<HealthWorkerHandle | null>([
+      healthWorkerPromise,
+      new Promise<null>((res) => setTimeout(() => res(null), 1_500).unref()),
+    ]);
+    if (handle) {
+      await handle.shutdown().catch(() => {});
+    }
     server.close(() => {
       log.info("Server closed");
       process.exit(0);

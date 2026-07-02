@@ -1,5 +1,13 @@
 import { describe, it, expect } from "vitest";
-import { calculateOptimalWorkers, distributeFrames } from "./parallelCoordinator.js";
+import {
+  calculateOptimalWorkers,
+  distributeFrames,
+  formatWorkerFailure,
+  selectWorkerDiagnostics,
+  shouldDisableBrowserPoolForParallelWorker,
+  shouldVerifyWorkerGpu,
+} from "./parallelCoordinator.js";
+import type { EngineConfig } from "../config.js";
 
 describe("distributeFrames", () => {
   it("distributes frames evenly across workers", () => {
@@ -66,5 +74,105 @@ describe("calculateOptimalWorkers", () => {
     });
 
     expect(workers).toBe(4);
+  });
+});
+
+describe("shouldDisableBrowserPoolForParallelWorker", () => {
+  const linuxHeadlessWorker = {
+    parallel: true,
+    platform: "linux" as NodeJS.Platform,
+    deviceScaleFactor: 1,
+    headlessShellPath: "/tmp/chrome-headless-shell",
+  };
+
+  it.each([
+    ["BeginFrame", false],
+    ["forced screenshot", true],
+  ])(
+    "disables the browser pool for parallel Linux/headless %s workers",
+    (_mode, forceScreenshot) => {
+      expect(
+        shouldDisableBrowserPoolForParallelWorker({
+          ...linuxHeadlessWorker,
+          forceScreenshot,
+        }),
+      ).toBe(true);
+    },
+  );
+
+  it.each([
+    ["non-parallel", { parallel: false, forceScreenshot: true }],
+    ["non-linux", { platform: "darwin" as NodeJS.Platform, forceScreenshot: true }],
+    ["no headless shell", { headlessShellPath: undefined, forceScreenshot: true }],
+    ["supersampled", { deviceScaleFactor: 2, forceScreenshot: false }],
+  ])("keeps the shared pool for %s workers", (_case, overrides) => {
+    expect(
+      shouldDisableBrowserPoolForParallelWorker({
+        ...linuxHeadlessWorker,
+        ...overrides,
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("worker failure diagnostics", () => {
+  it("keeps only actionable worker diagnostics and caps the tail", () => {
+    const diagnostics = selectWorkerDiagnostics(
+      [
+        "[Browser] harmless log",
+        "[Browser:WARN] noisy warning",
+        "[Browser:REQUESTFAILED] GET https://cdn.example.com/a.mp4 resource=media error=net::ERR_FAILED",
+        "[Browser:HTTP404] GET https://cdn.example.com/missing.png resource=image Not Found",
+        "[FrameCapture:ERROR] page.goto failed mode=screenshot timeoutMs=60000 elapsedMs=60001 url=http://127.0.0.1:4173/index.html error=timeout",
+      ],
+      2,
+    );
+
+    expect(diagnostics).toEqual([
+      "[Browser:HTTP404] GET https://cdn.example.com/missing.png resource=image Not Found",
+      "[FrameCapture:ERROR] page.goto failed mode=screenshot timeoutMs=60000 elapsedMs=60001 url=http://127.0.0.1:4173/index.html error=timeout",
+    ]);
+  });
+
+  it("adds compact diagnostics to the worker failure message", () => {
+    expect(
+      formatWorkerFailure({
+        workerId: 1,
+        framesCaptured: 0,
+        startFrame: 0,
+        endFrame: 30,
+        durationMs: 60_100,
+        error: "Navigation timeout of 60000 ms exceeded",
+        diagnostics: ["[FrameCapture:ERROR] page.goto failed\n  mode=screenshot timeoutMs=60000"],
+      }),
+    ).toBe(
+      "Worker 1: Navigation timeout of 60000 ms exceeded; diagnostics: [FrameCapture:ERROR] page.goto failed mode=screenshot timeoutMs=60000",
+    );
+  });
+});
+
+describe("shouldVerifyWorkerGpu", () => {
+  const softwareConfig: Partial<EngineConfig> = { browserGpuMode: "software" };
+
+  it("returns true for worker 0 when GPU mode is software", () => {
+    expect(shouldVerifyWorkerGpu(0, softwareConfig)).toBe(true);
+  });
+
+  it("returns false for non-zero workers when GPU mode is software", () => {
+    expect(shouldVerifyWorkerGpu(1, softwareConfig)).toBe(false);
+    expect(shouldVerifyWorkerGpu(5, softwareConfig)).toBe(false);
+    expect(shouldVerifyWorkerGpu(17, softwareConfig)).toBe(false);
+  });
+
+  it("returns false for any worker when GPU mode is not software", () => {
+    expect(shouldVerifyWorkerGpu(0, { browserGpuMode: "hardware" } as Partial<EngineConfig>)).toBe(
+      false,
+    );
+    expect(shouldVerifyWorkerGpu(0, {})).toBe(false);
+  });
+
+  it("returns false when config is undefined", () => {
+    expect(shouldVerifyWorkerGpu(0, undefined)).toBe(false);
+    expect(shouldVerifyWorkerGpu(3, undefined)).toBe(false);
   });
 });

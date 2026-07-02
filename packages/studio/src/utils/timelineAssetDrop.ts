@@ -1,6 +1,9 @@
 import { AUDIO_EXT, IMAGE_EXT, VIDEO_EXT } from "./mediaTypes";
+import { roundToCenti } from "./rounding";
+import { COMPOSITION_ROOT_OPEN_TAG_RE } from "./compositionPatterns";
 
 export const TIMELINE_ASSET_MIME = "application/x-hyperframes-asset";
+export const TIMELINE_BLOCK_MIME = "application/x-hyperframes-block";
 const FALLBACK_TIMELINE_FILE_DROP_DURATION = 5;
 
 export type TimelineAssetKind = "image" | "video" | "audio";
@@ -50,13 +53,13 @@ export function buildTimelineFileDropPlacements(
   durations: number[],
   occupiedClips: Array<{ start: number; duration: number; track: number }> = [],
 ): Array<{ start: number; track: number }> {
-  let nextStart = Math.round(Math.max(0, placement.start) * 100) / 100;
+  let nextStart = roundToCenti(Math.max(0, placement.start));
   const sequenceStart = nextStart;
   const resolvedDurations = durations.map((duration) =>
     Number.isFinite(duration) && duration > 0 ? duration : FALLBACK_TIMELINE_FILE_DROP_DURATION,
   );
   const sequenceEnd = resolvedDurations.reduce(
-    (end, duration) => Math.round((end + duration) * 100) / 100,
+    (end, duration) => roundToCenti(end + duration),
     sequenceStart,
   );
   const overlapsDropTrack = occupiedClips.some((clip) => {
@@ -71,9 +74,26 @@ export function buildTimelineFileDropPlacements(
 
   return resolvedDurations.map((duration) => {
     const start = nextStart;
-    nextStart = Math.round((nextStart + duration) * 100) / 100;
+    nextStart = roundToCenti(nextStart + duration);
     return { start, track };
   });
+}
+
+export function resolveTimelineAssetInitialGeometry(source: string): {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+} {
+  const width = Number.parseFloat(source.match(/\bdata-width=(["'])([^"']+)\1/i)?.[2] ?? "");
+  const height = Number.parseFloat(source.match(/\bdata-height=(["'])([^"']+)\1/i)?.[2] ?? "");
+
+  return {
+    left: 0,
+    top: 0,
+    width: Number.isFinite(width) && width > 0 ? Math.round(width) : 640,
+    height: Number.isFinite(height) && height > 0 ? Math.round(height) : 360,
+  };
 }
 
 export function buildTimelineAssetInsertHtml(input: {
@@ -84,26 +104,35 @@ export function buildTimelineAssetInsertHtml(input: {
   duration: number;
   track: number;
   zIndex: number;
+  geometry?: { left: number; top: number; width: number; height: number };
 }): string {
   const sharedAttrs = `id="${input.id}" class="clip" src="${input.assetPath}" data-start="${input.start}" data-duration="${input.duration}" data-track-index="${input.track}"`;
+  const geometry = input.geometry ?? { left: 0, top: 0, width: 640, height: 360 };
+  const visualStyles = `position: absolute; left: ${geometry.left}px; top: ${geometry.top}px; width: ${geometry.width}px; height: ${geometry.height}px; object-fit: contain; z-index: ${input.zIndex}`;
 
   if (input.kind === "image") {
-    return `<img ${sharedAttrs} style="position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; z-index: ${input.zIndex}" />`;
+    return `<img ${sharedAttrs} style="${visualStyles}" />`;
   }
 
   if (input.kind === "video") {
-    return `<video ${sharedAttrs} muted playsinline style="position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; z-index: ${input.zIndex}"></video>`;
+    return `<video ${sharedAttrs} muted playsinline style="${visualStyles}"></video>`;
   }
 
   return `<audio ${sharedAttrs} style="z-index: ${input.zIndex}"></audio>`;
 }
 
 export function insertTimelineAssetIntoSource(source: string, assetHtml: string): string {
-  const rootOpenTag = /<[^>]*data-composition-id="[^"]+"[^>]*>/i;
-  const match = rootOpenTag.exec(source);
+  const match = COMPOSITION_ROOT_OPEN_TAG_RE.exec(source);
   if (!match || match.index == null) {
     throw new Error("No composition root found in target source");
   }
   const insertAt = match.index + match[0].length;
-  return `${source.slice(0, insertAt)}${assetHtml}${source.slice(insertAt)}`;
+  const lineStart = source.lastIndexOf("\n", match.index);
+  const leadingWhitespace = source.slice(lineStart + 1, match.index).match(/^(\s*)/)?.[1] ?? "";
+  const childIndent = leadingWhitespace + "  ";
+  const indented = assetHtml
+    .split("\n")
+    .map((line, i) => (i === 0 ? line : childIndent + line))
+    .join("\n");
+  return `${source.slice(0, insertAt)}\n${childIndent}${indented}${source.slice(insertAt)}`;
 }

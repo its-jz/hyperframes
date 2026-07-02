@@ -17,13 +17,17 @@ const FLUSH_TIMEOUT_MS = 5_000;
 // ---------------------------------------------------------------------------
 
 interface EventProperties {
-  [key: string]: string | number | boolean | undefined;
+  [key: string]: string | number | boolean | null | undefined;
 }
 
 let eventQueue: Array<{
   event: string;
   properties: EventProperties;
   timestamp: string;
+  // Override for the batch distinct_id. Defaults to the install's anonymousId.
+  // Used to attribute server-side studio renders to the browser user who
+  // triggered them, so the render funnel is joinable across processes.
+  distinctId?: string;
 }> = [];
 
 let telemetryEnabled: boolean | null = null;
@@ -36,11 +40,6 @@ export function shouldTrack(): boolean {
   if (telemetryEnabled !== null) return telemetryEnabled;
 
   if (process.env["HYPERFRAMES_NO_TELEMETRY"] === "1" || process.env["DO_NOT_TRACK"] === "1") {
-    telemetryEnabled = false;
-    return false;
-  }
-
-  if (process.env["CI"] === "true" || process.env["CI"] === "1") {
     telemetryEnabled = false;
     return false;
   }
@@ -64,12 +63,17 @@ export function shouldTrack(): boolean {
 /**
  * Queue a telemetry event. Non-blocking, fail-silent.
  */
-export function trackEvent(event: string, properties: EventProperties = {}): void {
+export function trackEvent(
+  event: string,
+  properties: EventProperties = {},
+  distinctId?: string,
+): void {
   if (!shouldTrack()) return;
 
   const sys = getSystemMeta();
   eventQueue.push({
     event,
+    distinctId,
     properties: {
       ...properties,
       cli_version: VERSION,
@@ -86,9 +90,32 @@ export function trackEvent(event: string, properties: EventProperties = {}): voi
       ci_name: sys.ci_name ?? undefined,
       is_wsl: sys.is_wsl,
       is_tty: sys.is_tty,
+      sandbox_runtime: sys.sandbox_runtime ?? undefined,
+      agent_runtime: sys.agent_runtime ?? undefined,
     },
     timestamp: new Date().toISOString(),
   });
+}
+
+/**
+ * Drain the in-memory queue into a PostHog `/batch/` payload string.
+ * Returns null when there's nothing to send. Resets the queue as a side effect
+ * so callers can fire-and-forget the resulting payload.
+ *
+ * $ip:null tells PostHog not to record the request IP for any of these events.
+ * Server-side "Discard client IP data" is also enabled in project settings.
+ */
+function drainQueueToPayload(): string | null {
+  if (eventQueue.length === 0) return null;
+  const config = readConfig();
+  const batch = eventQueue.map((e) => ({
+    event: e.event,
+    properties: { ...e.properties, $ip: null },
+    distinct_id: e.distinctId ?? config.anonymousId,
+    timestamp: e.timestamp,
+  }));
+  eventQueue = [];
+  return JSON.stringify({ api_key: POSTHOG_API_KEY, batch });
 }
 
 /**
@@ -96,20 +123,8 @@ export function trackEvent(event: string, properties: EventProperties = {}): voi
  * Called before normal process exit via `beforeExit`.
  */
 export async function flush(): Promise<void> {
-  if (eventQueue.length === 0) {
-    return;
-  }
-
-  const config = readConfig();
-  const batch = eventQueue.map((e) => ({
-    event: e.event,
-    // $ip: null tells PostHog to not record the request IP for this event.
-    // Server-side "Discard client IP data" is also enabled in project settings.
-    properties: { ...e.properties, $ip: null },
-    distinct_id: config.anonymousId,
-    timestamp: e.timestamp,
-  }));
-  eventQueue = [];
+  const payload = drainQueueToPayload();
+  if (payload == null) return;
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), FLUSH_TIMEOUT_MS);
@@ -118,7 +133,7 @@ export async function flush(): Promise<void> {
     await fetch(`${POSTHOG_HOST}/batch/`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Connection: "close" },
-      body: JSON.stringify({ api_key: POSTHOG_API_KEY, batch }),
+      body: payload,
       signal: controller.signal,
     });
   } catch {
@@ -134,20 +149,8 @@ export async function flush(): Promise<void> {
  * so the parent process exits immediately without waiting.
  */
 export function flushSync(): void {
-  if (eventQueue.length === 0) {
-    return;
-  }
-
-  const config = readConfig();
-  const batch = eventQueue.map((e) => ({
-    event: e.event,
-    properties: { ...e.properties, $ip: null },
-    distinct_id: config.anonymousId,
-    timestamp: e.timestamp,
-  }));
-  eventQueue = [];
-
-  const payload = JSON.stringify({ api_key: POSTHOG_API_KEY, batch });
+  const payload = drainQueueToPayload();
+  if (payload == null) return;
 
   try {
     const { spawn } = require("node:child_process") as typeof import("node:child_process");

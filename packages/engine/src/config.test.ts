@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { resolveConfig, DEFAULT_CONFIG } from "./config.js";
+import { resolveConfig, DEFAULT_CONFIG, scaleProtocolTimeoutForComposition } from "./config.js";
+import { isLowMemorySystem } from "./services/systemMemory.js";
 
 describe("resolveConfig", () => {
   const savedEnv = new Map<string, string | undefined>();
@@ -32,6 +33,7 @@ describe("resolveConfig", () => {
     expect(config.browserGpuMode).toBe("software");
     expect(config.enableStreamingEncode).toBe(true);
     expect(config.streamingEncodeMaxDurationSeconds).toBe(240);
+    expect((config as Record<string, unknown>).vp9CpuUsed).toBe(4);
     expect(config.audioGain).toBe(1);
     expect(config.debug).toBe(false);
   });
@@ -81,6 +83,28 @@ describe("resolveConfig", () => {
 
     const config = resolveConfig();
     expect(config.streamingEncodeMaxDurationSeconds).toBe(0);
+  });
+
+  it("reads VP9 cpu-used from env", () => {
+    setEnv("PRODUCER_VP9_CPU_USED", "6");
+
+    const config = resolveConfig();
+    expect((config as Record<string, unknown>).vp9CpuUsed).toBe(6);
+  });
+
+  it("falls back to the VP9 cpu-used default for invalid env values", () => {
+    setEnv("PRODUCER_VP9_CPU_USED", "fast");
+
+    const config = resolveConfig();
+    expect((config as Record<string, unknown>).vp9CpuUsed).toBe(4);
+  });
+
+  it("clamps VP9 cpu-used env values to libvpx's supported range", () => {
+    setEnv("PRODUCER_VP9_CPU_USED", "99");
+    expect((resolveConfig() as Record<string, unknown>).vp9CpuUsed).toBe(8);
+
+    process.env.PRODUCER_VP9_CPU_USED = "-99";
+    expect((resolveConfig() as Record<string, unknown>).vp9CpuUsed).toBe(-8);
   });
 
   it("treats non-'true' boolean env vars as false", () => {
@@ -137,5 +161,93 @@ describe("resolveConfig", () => {
 
     const config = resolveConfig();
     expect(config.frameDataUriCacheLimit).toBe(32);
+  });
+
+  describe("enablePageSideCompositing (HF_PAGE_SIDE_COMPOSITING)", () => {
+    it("defaults to true", () => {
+      const config = resolveConfig();
+      expect(config.enablePageSideCompositing).toBe(true);
+    });
+
+    it("disabled when HF_PAGE_SIDE_COMPOSITING=false", () => {
+      setEnv("HF_PAGE_SIDE_COMPOSITING", "false");
+      const config = resolveConfig();
+      expect(config.enablePageSideCompositing).toBe(false);
+    });
+
+    it("explicit override wins over the env var", () => {
+      setEnv("HF_PAGE_SIDE_COMPOSITING", "true");
+      const config = resolveConfig({ enablePageSideCompositing: false });
+      expect(config.enablePageSideCompositing).toBe(false);
+    });
+  });
+
+  describe("lowMemoryMode", () => {
+    it("forces on for truthy PRODUCER_LOW_MEMORY_MODE values", () => {
+      setEnv("PRODUCER_LOW_MEMORY_MODE", "true");
+      for (const v of ["true", "on", "1", "TRUE"]) {
+        process.env.PRODUCER_LOW_MEMORY_MODE = v;
+        expect(resolveConfig().lowMemoryMode).toBe(true);
+      }
+    });
+
+    it("forces off for falsy PRODUCER_LOW_MEMORY_MODE values", () => {
+      setEnv("PRODUCER_LOW_MEMORY_MODE", "false");
+      for (const v of ["false", "off", "0", "OFF"]) {
+        process.env.PRODUCER_LOW_MEMORY_MODE = v;
+        expect(resolveConfig().lowMemoryMode).toBe(false);
+      }
+    });
+
+    it("auto-detects from total RAM when the env var is unset", () => {
+      setEnv("PRODUCER_LOW_MEMORY_MODE", "");
+      delete process.env.PRODUCER_LOW_MEMORY_MODE;
+      expect(resolveConfig().lowMemoryMode).toBe(isLowMemorySystem());
+    });
+
+    it("explicit override beats both env and auto-detection", () => {
+      setEnv("PRODUCER_LOW_MEMORY_MODE", "true");
+      expect(resolveConfig({ lowMemoryMode: false }).lowMemoryMode).toBe(false);
+    });
+  });
+});
+
+describe("scaleProtocolTimeoutForComposition", () => {
+  const base = 300_000;
+
+  it("keeps the base timeout for a reference-or-smaller canvas", () => {
+    // 1080p == reference area → factor 1, no scale.
+    expect(scaleProtocolTimeoutForComposition(base, { width: 1920, height: 1080 })).toBe(base);
+    // Smaller than reference → still the base (never scales down).
+    expect(scaleProtocolTimeoutForComposition(base, { width: 1280, height: 720 })).toBe(base);
+  });
+
+  it("scales up proportionally with output pixel area", () => {
+    // 4K == 4× the reference area, which stays under the 30-minute ceiling.
+    const scaled = scaleProtocolTimeoutForComposition(base, { width: 3840, height: 2160 });
+    expect(scaled).toBeGreaterThan(base);
+    expect(scaled).toBe(base * 4);
+  });
+
+  it("clamps at the 30-minute ceiling for a pathological canvas", () => {
+    // 8K == 16× area → 4.8M ms, clamped to the 30-minute ceiling.
+    const scaled = scaleProtocolTimeoutForComposition(base, { width: 7680, height: 4320 });
+    expect(scaled).toBe(1_800_000);
+  });
+
+  it("never lowers a base timeout that already exceeds the ceiling", () => {
+    // Base above the 30-min ceiling + a large canvas: must not clamp below base.
+    const highBase = 2_400_000;
+    expect(
+      scaleProtocolTimeoutForComposition(highBase, { width: 3840, height: 2160 }),
+    ).toBeGreaterThanOrEqual(highBase);
+  });
+
+  it("returns the base timeout for degenerate dimensions", () => {
+    expect(scaleProtocolTimeoutForComposition(base, { width: 0, height: 1080 })).toBe(base);
+    expect(scaleProtocolTimeoutForComposition(base, { width: 1920, height: 0 })).toBe(base);
+    expect(scaleProtocolTimeoutForComposition(base, { width: Number.NaN, height: 1080 })).toBe(
+      base,
+    );
   });
 });

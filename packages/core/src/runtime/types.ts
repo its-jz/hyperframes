@@ -1,3 +1,5 @@
+import type { HfColorGradingTarget } from "../colorGrading";
+
 export type RuntimeJson =
   | string
   | number
@@ -6,16 +8,17 @@ export type RuntimeJson =
   | RuntimeJson[]
   | { [key: string]: RuntimeJson };
 
+import type { HyperframeControlAction } from "../inline-scripts/runtimeContract.js";
+import type { HyperframePickerElementInfo } from "../inline-scripts/pickerApi.js";
+
 export type RuntimeBridgeControlAction =
-  | "play"
-  | "pause"
-  | "seek"
-  | "set-muted"
+  | HyperframeControlAction
+  | "tick"
   | "set-volume"
   | "set-media-output-muted"
-  | "set-playback-rate"
-  | "enable-pick-mode"
-  | "disable-pick-mode"
+  | "set-native-media-sync-disabled"
+  | "set-web-audio-media-disabled"
+  | "stop-media"
   | "flash-elements";
 
 export type RuntimeBridgeControlMessage = {
@@ -25,7 +28,11 @@ export type RuntimeBridgeControlMessage = {
   frame?: number;
   muted?: boolean;
   volume?: number;
+  disabled?: boolean;
   playbackRate?: number;
+  target?: HfColorGradingTarget | string | null;
+  grading?: RuntimeJson;
+  compare?: RuntimeJson;
   seekMode?: "drag" | "commit";
 };
 
@@ -84,23 +91,7 @@ export type RuntimeDiagnosticMessage = {
   details: Record<string, RuntimeJson>;
 };
 
-export type RuntimePickerBoundingBox = {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-};
-
-export type RuntimePickerElementInfo = {
-  id: string | null;
-  tagName: string;
-  selector: string;
-  label: string;
-  boundingBox: RuntimePickerBoundingBox;
-  textContent: string | null;
-  src: string | null;
-  dataAttributes: Record<string, string>;
-};
+export type RuntimePickerElementInfo = HyperframePickerElementInfo;
 
 export type RuntimePickerHoveredMessage = {
   source: "hf-preview";
@@ -153,6 +144,20 @@ export type RuntimeMediaAutoplayBlockedMessage = {
 };
 
 /**
+ * Posted by the runtime when `installRuntimeControlBridge` finishes registering
+ * its message listener — signals that subsequent control messages
+ * (`set-muted`, `set-volume`, `set-playback-rate`, etc.) will now be received
+ * and processed. The parent (web component / host app) listens for this and
+ * replays current playback state to repair any race where bridge messages
+ * were posted before the listener was installed. Emitted again on every iframe
+ * reload because the new runtime instance starts with no state.
+ */
+export type RuntimeReadyMessage = {
+  source: "hf-preview";
+  type: "ready";
+};
+
+/**
  * Analytics events emitted by the runtime.
  *
  * The host app receives these via postMessage and forwards to its analytics
@@ -198,6 +203,7 @@ export type RuntimeOutboundMessage =
   | RuntimePickerCancelledMessage
   | RuntimeStageSizeMessage
   | RuntimeMediaAutoplayBlockedMessage
+  | RuntimeReadyMessage
   | RuntimeAnalyticsMessage
   | RuntimePerformanceMessage;
 
@@ -205,7 +211,7 @@ export type RuntimePlayer = {
   _timeline: RuntimeTimelineLike | null;
   play: () => void;
   pause: () => void;
-  seek: (timeSeconds: number) => void;
+  seek: (timeSeconds: number, options?: { keepPlaying?: boolean }) => void;
   renderSeek: (timeSeconds: number) => void;
   getTime: () => number;
   getDuration: () => number;
@@ -234,6 +240,44 @@ export type RuntimeDeterministicAdapter = {
   pause: () => void;
   play?: () => void;
   revert?: () => void;
+  /**
+   * Optional async readiness gate. If the adapter has outstanding async work
+   * (e.g. Three.js's `DefaultLoadingManager` still loading models/textures),
+   * return a promise that settles when the work is done. The runtime waits
+   * for the returned promise to settle before publishing
+   * `window.__renderReady = true`, so the engine doesn't capture empty
+   * frames while assets are still loading.
+   *
+   * Return `null` (or omit the method) when nothing is pending. The runtime
+   * calls this on every readiness-publish evaluation and tracks promise
+   * identity, so returning the same promise on repeated calls is the
+   * expected contract — return a fresh promise only when a new wait is
+   * actually needed (e.g. a new batch of items has been queued).
+   *
+   * Throwing or rejecting is safe: the runtime swallows the error and
+   * proceeds to publish (matching the existing failure-doesn't-block-render
+   * convention).
+   */
+  getReadyPromise?: () => PromiseLike<unknown> | null;
+  /**
+   * Optional duration auto-inference. Non-GSAP runtimes (CSS, WAAPI, Lottie)
+   * have no `window.__timelines` entry, so the runtime has no authored source
+   * of truth for total composition length unless the author sets
+   * `data-duration` on the root element. This hook lets an adapter report the
+   * longest end time it can discover from its own animations, so the runtime
+   * can fold it into the duration floor (see `resolveAdapterDurationFloorSeconds`
+   * in `init.ts`) and treat `data-duration` as optional rather than required.
+   *
+   * Return the inferred duration in seconds, or `null` when nothing usable
+   * was discovered (e.g. no animations yet, or an animation with unbounded /
+   * infinite iteration count that can't be resolved to a finite end time —
+   * those compositions must keep declaring `data-duration` explicitly).
+   *
+   * Called on every adapter-discovery cycle (same cadence as `discover`), so
+   * it's safe — and expected — to return a growing value as async work
+   * (Lottie JSON fetch, etc.) resolves.
+   */
+  getInferredDurationSeconds?: () => number | null;
 };
 
 export type RuntimeGsapSetTarget = string | Element | Element[] | null;

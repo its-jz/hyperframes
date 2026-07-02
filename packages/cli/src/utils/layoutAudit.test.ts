@@ -1,13 +1,67 @@
 import { describe, expect, it } from "vitest";
 import {
   buildLayoutSampleTimes,
+  buildTransitionSampleTimes,
   computeOverflow,
+  overflowValueClips,
   collapseStaticLayoutIssues,
   limitLayoutIssues,
+  mergeSampleTimes,
   summarizeLayoutIssues,
   formatLayoutIssue,
   type LayoutIssue,
 } from "./layoutAudit.js";
+
+describe("buildTransitionSampleTimes (#1380)", () => {
+  it("samples boundaries plus the midpoint of each segment between them", () => {
+    // The #1380 repro: capA fades out 11.33–11.55, capB slams in 11.35–11.69.
+    // The collision window 11.35–11.55 only shows both captions half-visible
+    // away from the exact boundaries — the midpoints land inside it.
+    const result = buildTransitionSampleTimes({
+      duration: 20,
+      boundaries: [11.33, 11.55, 11.35, 11.69],
+    });
+    expect(result.times).toEqual([11.33, 11.34, 11.35, 11.45, 11.55, 11.62, 11.69]);
+    expect(result.dropped).toBe(0);
+  });
+
+  it("drops boundaries outside the composition and dedupes repeats", () => {
+    const result = buildTransitionSampleTimes({
+      duration: 10,
+      boundaries: [2, 2, -1, 10.5, NaN, 4],
+    });
+    expect(result.times).toEqual([2, 3, 4]);
+    expect(result.dropped).toBe(0);
+  });
+
+  it("returns an empty list without a valid duration", () => {
+    expect(buildTransitionSampleTimes({ duration: 0, boundaries: [1, 2] })).toEqual({
+      times: [],
+      dropped: 0,
+    });
+  });
+
+  it("samples every collected boundary when no cap is given", () => {
+    const boundaries = Array.from({ length: 200 }, (_, i) => i * 0.05);
+    const result = buildTransitionSampleTimes({ duration: 10, boundaries });
+    // 200 boundaries + 199 segment midpoints, all distinct after rounding.
+    expect(result.times.length).toBe(399);
+    expect(result.dropped).toBe(0);
+  });
+
+  it("caps only on explicit request, reporting the omitted count and keeping the extremes", () => {
+    const boundaries = Array.from({ length: 200 }, (_, i) => i * 0.05);
+    const result = buildTransitionSampleTimes({ duration: 10, boundaries, cap: 40 });
+    expect(result.times.length).toBeLessThanOrEqual(40);
+    expect(result.dropped).toBe(399 - result.times.length);
+    expect(result.times[0]).toBe(0);
+    expect(result.times[result.times.length - 1]).toBeCloseTo(9.95, 3);
+  });
+
+  it("merges with even-spacing samples into one deduplicated ascending list", () => {
+    expect(mergeSampleTimes([1, 3, 5], [3, 2.5, 7])).toEqual([1, 2.5, 3, 5, 7]);
+  });
+});
 
 describe("layoutAudit helpers", () => {
   it("samples the whole duration using stable midpoint timestamps", () => {
@@ -110,6 +164,22 @@ describe("layoutAudit helpers", () => {
     });
 
     expect(formatted).toContain("t=1-5s (3 samples)");
+  });
+
+  // The clip rule that suppresses the odometer/ticker false positive: text
+  // spilling past an `overflow:hidden` reel window is the mechanism, not a bug.
+  it("treats clipping overflow values as masking (suppress) and visible as not (still report)", () => {
+    // Intended clipping — the queued digit rows of a reel are masked here.
+    expect(overflowValueClips("hidden")).toBe(true);
+    expect(overflowValueClips("clip")).toBe(true);
+    expect(overflowValueClips("auto")).toBe(true);
+    expect(overflowValueClips("scroll")).toBe(true);
+    // Genuine overflow — nothing masks the text, so it must STILL be reported.
+    expect(overflowValueClips("visible")).toBe(false);
+    expect(overflowValueClips("clip visible")).toBe(false);
+    expect(overflowValueClips("")).toBe(false);
+    expect(overflowValueClips(null)).toBe(false);
+    expect(overflowValueClips(undefined)).toBe(false);
   });
 
   it("limits returned issues by severity before truncating", () => {

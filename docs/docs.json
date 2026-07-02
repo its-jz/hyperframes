@@ -53,7 +53,10 @@
             "group": "Getting Started",
             "pages": [
               "introduction",
+              "changelog",
+              "weekly-updates",
               "quickstart",
+              "showcase",
               "examples",
               "launch-videos"
             ]
@@ -63,6 +66,7 @@
             "pages": [
               "concepts/compositions",
               "concepts/data-attributes",
+              "concepts/variables",
               "concepts/frame-adapters",
               "concepts/determinism"
             ]
@@ -70,15 +74,21 @@
           {
             "group": "Guides",
             "pages": [
+              "guides/pipeline",
+              "guides/skills",
+              "guides/authentication",
+              "guides/video-components",
               "guides/html-in-canvas",
               "guides/website-to-video",
+              "guides/antigravity",
+              "guides/copilot-cli",
               "guides/claude-design",
               "guides/open-design",
               "guides/prompting",
               "guides/hyperframes-vs-remotion",
               "guides/gsap-animation",
+              "guides/keyframes",
               "guides/rendering",
-              "guides/deploy",
               "guides/remove-background",
               "guides/hdr",
               "guides/4k-rendering",
@@ -86,7 +96,19 @@
               "guides/timeline-editing",
               "guides/video-editor-cheatsheet",
               "guides/common-mistakes",
-              "guides/troubleshooting"
+              "guides/troubleshooting",
+              "guides/feedback"
+            ]
+          },
+          {
+            "group": "Deploy",
+            "pages": [
+              "deploy/cloud",
+              "guides/deploy",
+              "deploy/aws-lambda",
+              "deploy/gcp-cloud-run",
+              "deploy/templates-on-lambda",
+              "deploy/migrating-to-hyperframes-lambda"
             ]
           }
         ]
@@ -95,8 +117,48 @@
         "tab": "Catalog",
         "groups": [
           {
+            "group": "Code Animations",
+            "pages": [
+              "catalog/blocks/code-3d-extrude",
+              "catalog/blocks/code-shader-dissolve",
+              "catalog/blocks/code-particle-assemble",
+              "catalog/blocks/code-morph",
+              "catalog/blocks/code-snippet-flight",
+              "catalog/blocks/code-typing",
+              "catalog/blocks/code-diff",
+              "catalog/blocks/code-highlight",
+              "catalog/blocks/code-scroll"
+            ]
+          },
+          {
+            "group": "Captions",
+            "pages": [
+              "catalog/components/caption-clip-wipe",
+              "catalog/components/caption-editorial-emphasis",
+              "catalog/components/caption-emoji-pop",
+              "catalog/components/caption-glitch-rgb",
+              "catalog/components/caption-gradient-fill",
+              "catalog/components/caption-highlight",
+              "catalog/components/caption-kinetic-slam",
+              "catalog/components/caption-matrix-decode",
+              "catalog/components/caption-neon-accent",
+              "catalog/components/caption-neon-glow",
+              "catalog/components/caption-parallax-layers",
+              "catalog/components/caption-particle-burst",
+              "catalog/components/caption-pill-karaoke",
+              "catalog/components/caption-texture",
+              "catalog/components/caption-weight-shift"
+            ]
+          },
+          {
             "group": "HTML-in-Canvas",
             "pages": [
+              "catalog/blocks/ios26-liquid-glass",
+              "catalog/blocks/liquid-glass-context-menu",
+              "catalog/blocks/liquid-glass-media-controls",
+              "catalog/blocks/liquid-glass-notification",
+              "catalog/blocks/liquid-glass-widgets",
+              "catalog/blocks/macos-tahoe-liquid-glass",
               "catalog/blocks/vfx-iphone-device",
               "catalog/blocks/vfx-liquid-background",
               "catalog/blocks/vfx-liquid-glass",
@@ -116,6 +178,23 @@
               "catalog/blocks/tiktok-follow",
               "catalog/blocks/x-post",
               "catalog/blocks/yt-lower-third"
+            ]
+          },
+          {
+            "group": "Lower Thirds",
+            "pages": [
+              "catalog/blocks/lower-third-bild",
+              "catalog/blocks/lt-accent-underline",
+              "catalog/blocks/lt-bold-block",
+              "catalog/blocks/lt-clean-bar",
+              "catalog/blocks/lt-color-block",
+              "catalog/blocks/lt-dark-card",
+              "catalog/blocks/lt-kicker-name",
+              "catalog/blocks/lt-mask-reveal",
+              "catalog/blocks/lt-side-rule",
+              "catalog/blocks/lt-soft-pill",
+              "catalog/blocks/lt-stack-bars",
+              "catalog/blocks/news-ticker"
             ]
           },
           {
@@ -170,7 +249,13 @@
           {
             "group": "Data",
             "pages": [
-              "catalog/blocks/data-chart"
+              "catalog/blocks/data-chart",
+              "catalog/blocks/spain-map",
+              "catalog/blocks/us-map",
+              "catalog/blocks/us-map-bubble",
+              "catalog/blocks/us-map-flow",
+              "catalog/blocks/us-map-hex",
+              "catalog/blocks/world-map"
             ]
           },
           {
@@ -178,7 +263,17 @@
             "pages": [
               "catalog/components/grain-overlay",
               "catalog/components/grid-pixelate-wipe",
+              "catalog/components/parallax-unzoom",
+              "catalog/components/parallax-zoom",
               "catalog/components/shimmer-sweep",
+              "catalog/components/vignette"
+            ]
+          },
+          {
+            "group": "Text Effects",
+            "pages": [
+              "catalog/components/caption-blend-difference",
+              "catalog/components/morph-text",
               "catalog/components/texture-mask-text"
             ]
           },
@@ -186,7 +281,37 @@
             "group": "Blocks",
             "pages": [
               "catalog/blocks/flowchart",
+              "catalog/blocks/flowchart-vertical",
               "catalog/blocks/logo-outro"
+            ]
+          },
+          {
+            "group": "Code Snippets",
+            "pages": [
+              "catalog/blocks/code-snippet-apple-terminal-basic",
+              "catalog/blocks/code-snippet-apple-terminal-clear-dark",
+              "catalog/blocks/code-snippet-apple-terminal-clear-light",
+              "catalog/blocks/code-snippet-apple-terminal-grass",
+              "catalog/blocks/code-snippet-apple-terminal-homebrew",
+              "catalog/blocks/code-snippet-apple-terminal-man-page",
+              "catalog/blocks/code-snippet-apple-terminal-novel",
+              "catalog/blocks/code-snippet-apple-terminal-ocean",
+              "catalog/blocks/code-snippet-apple-terminal-pro",
+              "catalog/blocks/code-snippet-apple-terminal-red-sands",
+              "catalog/blocks/code-snippet-apple-terminal-silver-aerogel",
+              "catalog/blocks/code-snippet-apple-terminal-solid-colors",
+              "catalog/blocks/code-snippet-dark-2026",
+              "catalog/blocks/code-snippet-dark-modern",
+              "catalog/blocks/code-snippet-dark-plus",
+              "catalog/blocks/code-snippet-high-contrast",
+              "catalog/blocks/code-snippet-high-contrast-light",
+              "catalog/blocks/code-snippet-light-2026",
+              "catalog/blocks/code-snippet-light-modern",
+              "catalog/blocks/code-snippet-light-plus",
+              "catalog/blocks/code-snippet-monokai",
+              "catalog/blocks/code-snippet-solarized-light",
+              "catalog/blocks/code-snippet-visual-studio-dark",
+              "catalog/blocks/code-snippet-visual-studio-light"
             ]
           }
         ]
@@ -198,11 +323,53 @@
             "group": "Packages",
             "pages": [
               "packages/core",
+              "packages/parsers",
+              "packages/lint",
+              "packages/studio-server",
+              "packages/sdk",
               "packages/engine",
               "packages/player",
               "packages/producer",
+              "packages/shader-transitions",
+              "packages/aws-lambda",
+              "packages/gcp-cloud-run",
               "packages/studio",
               "packages/cli"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "SDK",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": [
+              "sdk/overview",
+              "sdk/quickstart"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "sdk/guides/querying-and-editing",
+              "sdk/guides/timing-and-animation",
+              "sdk/guides/undo-redo-and-patches",
+              "sdk/guides/persistence",
+              "sdk/guides/embedded-override-mode",
+              "sdk/guides/canvas-integration",
+              "sdk/guides/editing-affordances"
+            ]
+          },
+          {
+            "group": "Reference",
+            "pages": [
+              "sdk/reference/open-composition",
+              "sdk/reference/composition",
+              "sdk/reference/edit-operations",
+              "sdk/reference/types",
+              "sdk/reference/adapters",
+              "sdk/reference/utilities"
             ]
           }
         ]
@@ -222,7 +389,9 @@
               "contributing",
               "contributing/catalog",
               "contributing/release-channels",
-              "contributing/testing-local-changes"
+              "contributing/changelog-process",
+              "contributing/testing-local-changes",
+              "contributing/studio-manual-dom-editing"
             ]
           },
           {

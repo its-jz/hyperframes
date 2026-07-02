@@ -18,6 +18,9 @@ function runInit(args: string[]): { status: number; stdout: string; stderr: stri
   const res = spawnSync("bun", ["run", cliEntry, "init", ...args], {
     encoding: "utf-8",
     timeout: 30_000,
+    // The `--skip-skills` flag is neutered (see init.ts); the GitHub skills check
+    // is opted out only via this env var, so tests stay offline and fast.
+    env: { ...process.env, HYPERFRAMES_SKIP_SKILLS: "1" },
   });
   return {
     status: res.status ?? -1,
@@ -132,6 +135,91 @@ describe("hyperframes init flag rename", () => {
     expect(injected).not.toContain("setTimeout");
   });
 
+  it("-v works as the short alias for --video", () => {
+    const dir = mkdtempSync(join(tmpdir(), "hf-init-test-"));
+    const target = join(dir, "proj");
+    try {
+      const res = runInit([
+        target,
+        "--example",
+        "blank",
+        "--non-interactive",
+        "--skip-skills",
+        "-v",
+        "missing.mp4",
+      ]);
+      expect(res.status).toBe(1);
+      expect(res.stderr).toContain("Video file not found: missing.mp4");
+      expect(existsSync(target)).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("--audio with a missing file fails without creating the project directory", () => {
+    const dir = mkdtempSync(join(tmpdir(), "hf-init-test-"));
+    const target = join(dir, "proj");
+    try {
+      const res = runInit([
+        target,
+        "--example",
+        "blank",
+        "--non-interactive",
+        "--skip-skills",
+        "--audio",
+        "missing.mp3",
+      ]);
+      expect(res.status).toBe(1);
+      expect(res.stderr).toContain("Audio file not found: missing.mp3");
+      expect(existsSync(target)).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("--video and --audio together fail without creating the project directory", () => {
+    const dir = mkdtempSync(join(tmpdir(), "hf-init-test-"));
+    const target = join(dir, "proj");
+    try {
+      const res = runInit([
+        target,
+        "--example",
+        "blank",
+        "--non-interactive",
+        "--skip-skills",
+        "--video",
+        "clip.mp4",
+        "--audio",
+        "track.mp3",
+      ]);
+      expect(res.status).toBe(1);
+      expect(res.stderr).toContain("Cannot use --video and --audio together");
+      expect(existsSync(target)).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("-V prints a migration error instead of version fast-path", () => {
+    const dir = mkdtempSync(join(tmpdir(), "hf-init-test-"));
+    const target = join(dir, "proj");
+    try {
+      const res = runInit([
+        target,
+        "--example",
+        "blank",
+        "--non-interactive",
+        "--skip-skills",
+        "-V",
+        "missing.mp4",
+      ]);
+      expect(res.status).toBe(1);
+      expect(res.stderr).toContain("The -V short flag no longer maps to --video");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("--template prints a rename hint and exits non-zero", () => {
     const dir = mkdtempSync(join(tmpdir(), "hf-init-test-"));
     const target = join(dir, "proj");
@@ -204,6 +292,38 @@ describe("applyResolutionPreset", () => {
       expect(out).toContain('data-width="2160"');
       expect(out).toContain('data-height="3840"');
       expect(out).toContain('data-resolution="portrait-4k"');
+    });
+  });
+
+  it("swaps to square dimensions for square", () => {
+    withFixture((dir) => {
+      const file = join(dir, "index.html");
+      writeFileSync(file, sampleHtml, "utf-8");
+
+      applyResolutionPreset(dir, "square");
+      const out = readFileSync(file, "utf-8");
+
+      expect(out).toContain('data-width="1080"');
+      expect(out).toContain('data-height="1080"');
+      expect(out).toContain('data-resolution="square"');
+      expect(out).toContain("width: 1080px");
+      expect(out).toContain("height: 1080px");
+    });
+  });
+
+  it("swaps to square-4k dimensions", () => {
+    withFixture((dir) => {
+      const file = join(dir, "index.html");
+      writeFileSync(file, sampleHtml, "utf-8");
+
+      applyResolutionPreset(dir, "square-4k");
+      const out = readFileSync(file, "utf-8");
+
+      expect(out).toContain('data-width="2160"');
+      expect(out).toContain('data-height="2160"');
+      expect(out).toContain('data-resolution="square-4k"');
+      expect(out).toContain("width: 2160px");
+      expect(out).toContain("height: 2160px");
     });
   });
 

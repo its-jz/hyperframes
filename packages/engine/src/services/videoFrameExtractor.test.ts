@@ -18,12 +18,15 @@ import {
   extractAllVideoFrames,
   createFrameLookupTable,
   resolveProjectRelativeSrc,
+  resolveFrameFormat,
   codecMayHaveAlpha,
   decoderForCodec,
+  getFrameAtTime,
+  analyzeClipMediaFit,
   type VideoElement,
   type ExtractedFrames,
 } from "./videoFrameExtractor.js";
-import { extractVideoMetadata } from "../utils/ffprobe.js";
+import { extractVideoMetadata, type VideoMetadata } from "../utils/ffprobe.js";
 import { runFfmpeg } from "../utils/runFfmpeg.js";
 
 // ffmpeg is not preinstalled on GitHub's ubuntu-24.04 runners. The producer
@@ -67,6 +70,45 @@ describe("codec alpha capability", () => {
     expect(decoderForCodec("vp9")).toBe("libvpx-vp9");
     expect(decoderForCodec("VP9")).toBe("libvpx-vp9");
     expect(decoderForCodec("vp8")).toBe("libvpx");
+  });
+});
+
+describe("resolveFrameFormat", () => {
+  function metadata(overrides: Partial<VideoMetadata> = {}): VideoMetadata {
+    return {
+      durationSeconds: 1,
+      width: 320,
+      height: 180,
+      fps: 30,
+      hasAudio: false,
+      videoCodec: "h264",
+      colorSpace: {
+        colorTransfer: "bt709",
+        colorPrimaries: "bt709",
+        colorSpace: "bt709",
+      },
+      isVFR: false,
+      hasAlpha: false,
+      ...overrides,
+    };
+  }
+
+  it("keeps opaque non-alpha sources on jpg by default", () => {
+    expect(resolveFrameFormat(metadata(), undefined)).toBe("jpg");
+    expect(resolveFrameFormat(metadata(), "auto")).toBe("jpg");
+  });
+
+  it("honors explicit png for opaque videos", () => {
+    expect(resolveFrameFormat(metadata(), "png")).toBe("png");
+  });
+
+  it("honors explicit jpg for opaque videos", () => {
+    expect(resolveFrameFormat(metadata(), "jpg")).toBe("jpg");
+  });
+
+  it("forces png when alpha is present or the codec can carry alpha", () => {
+    expect(resolveFrameFormat(metadata({ hasAlpha: true }), "jpg")).toBe("png");
+    expect(resolveFrameFormat(metadata({ videoCodec: "vp9" }), "jpg")).toBe("png");
   });
 });
 
@@ -135,6 +177,35 @@ describe("resolveProjectRelativeSrc — sub-composition path clamping", () => {
     writeFileSync(join(compiledDir, "assets", "foo.mp4"), "");
     expect(resolveProjectRelativeSrc("assets/foo.mp4", projectDir, compiledDir)).toBe(
       join(compiledDir, "assets/foo.mp4"),
+    );
+  });
+
+  it("resolves percent-encoded non-Latin filenames across scripts", () => {
+    const projectDir = join(tmp, "project");
+    const cases = [
+      ["arabic", "%D9%87%D9%86%D8%A7-%D9%85%D8%B1%D9%88%D8%A7.mp4"],
+      ["japanese", "%E6%97%A5%E6%9C%AC%E8%AA%9E.mp4"],
+      ["cyrillic", "%D0%BF%D1%80%D0%B8%D0%B2%D0%B5%D1%82.mp4"],
+      ["korean", "%ED%95%9C%EA%B8%80.mp4"],
+    ] as const;
+
+    for (const [, encodedFilename] of cases) {
+      const filename = decodeURIComponent(encodedFilename);
+      writeFileSync(join(projectDir, "assets", filename), "");
+
+      expect(resolveProjectRelativeSrc(`assets/${encodedFilename}`, projectDir)).toBe(
+        join(projectDir, "assets", filename),
+      );
+    }
+  });
+
+  it("falls back to literal filenames when percent sequences are malformed", () => {
+    const projectDir = join(tmp, "project");
+    const filename = "100%-discount.mp4";
+    writeFileSync(join(projectDir, "assets", filename), "");
+
+    expect(resolveProjectRelativeSrc(`assets/${filename}`, projectDir)).toBe(
+      join(projectDir, "assets", filename),
     );
   });
 });
@@ -258,6 +329,127 @@ describe("FrameLookupTable", () => {
     expect(table.getActiveFramePayloads(0.5).has("hero")).toBe(true);
     expect(table.getActiveFramePayloads(1.5).has("hero")).toBe(false);
   });
+
+  it("holds the last frame at the inclusive clip end (t === end)", () => {
+    // clip [1,3] with exactly 2s of source frames (60 @ 30fps). The frame
+    // landing on t === end used to deactivate one frame early and render blank,
+    // while the runtime keeps the element visible on its last frame.
+    const table = createFrameLookupTable(
+      [
+        {
+          id: "hero",
+          src: "clip.webm",
+          start: 1,
+          end: 3,
+          mediaStart: 0,
+          loop: false,
+          hasAudio: false,
+        },
+      ],
+      [fakeExtracted(60, 30)],
+    );
+    const atEnd = table.getActiveFramePayloads(3.0).get("hero");
+    expect(atEnd?.frameIndex).toBe(59);
+    // mid-clip is unaffected
+    expect(table.getActiveFramePayloads(2.5).get("hero")?.frameIndex).toBe(45);
+  });
+
+  it("holds the last frame at the clip end even when the source is shorter than the window", () => {
+    // clip [0,5] with only 1s of source (30 @ 30fps). The mid-clip tail stays
+    // blank (source exhausted), but t === end still holds the last frame to
+    // match the runtime's inclusive visibility.
+    const table = createFrameLookupTable(
+      [
+        {
+          id: "hero",
+          src: "clip.webm",
+          start: 0,
+          end: 5,
+          mediaStart: 0,
+          loop: false,
+          hasAudio: false,
+        },
+      ],
+      [fakeExtracted(30, 30)],
+    );
+    expect(table.getActiveFramePayloads(1.5).has("hero")).toBe(false);
+    expect(table.getActiveFramePayloads(5.0).get("hero")?.frameIndex).toBe(29);
+  });
+
+  it("holds the last frame when the source is a sub-frame shorter than the slot", () => {
+    // clip [2, 3.45] declares a 1.45s slot, but `ffmpeg -t 1.45` at 30fps emits
+    // 43 frames = 1.433s — a half-frame short. The tail between source
+    // exhaustion (~3.433) and the clip end (3.45) must hold the last frame
+    // rather than render the page background (a one-frame black flash at the
+    // cut). The held index is the final extracted frame (42).
+    const table = createFrameLookupTable(
+      [
+        {
+          id: "hero",
+          src: "clip.mp4",
+          start: 2,
+          end: 3.45,
+          mediaStart: 0,
+          loop: false,
+          hasAudio: false,
+        },
+      ],
+      [fakeExtracted(43, 30)],
+    );
+    // last real frame
+    expect(table.getActiveFramePayloads(3.4).get("hero")?.frameIndex).toBe(42);
+    // source exhausted but within tolerance of the end → hold, don't blank
+    expect(table.getActiveFramePayloads(3.44).get("hero")?.frameIndex).toBe(42);
+    expect(table.getActiveFramePayloads(3.45).get("hero")?.frameIndex).toBe(42);
+  });
+
+  it("keeps both clips active at a shared adjacent boundary, matching the runtime", () => {
+    // clip A ends at 3.0, clip B starts at 3.0. The runtime shows both at the
+    // shared instant; the active set must too.
+    const table = createFrameLookupTable(
+      [
+        { id: "a", src: "a.webm", start: 0, end: 3, mediaStart: 0, loop: false, hasAudio: false },
+        { id: "b", src: "b.webm", start: 3, end: 6, mediaStart: 0, loop: false, hasAudio: false },
+      ],
+      // createFrameLookupTable maps each clip to extracted frames by id.
+      [
+        { ...fakeExtracted(90, 30), videoId: "a" },
+        { ...fakeExtracted(90, 30), videoId: "b" },
+      ],
+    );
+    const payloads = table.getActiveFramePayloads(3.0);
+    expect(payloads.has("a")).toBe(true);
+    expect(payloads.has("b")).toBe(true);
+  });
+});
+
+describe("analyzeClipMediaFit", () => {
+  it("returns null for a sub-tolerance shortfall the compiler leaves unclamped", () => {
+    // 1.433s media in a 1.45s slot — a sub-frame shortfall (<0.05s) the renderer
+    // freezes seamlessly and the compiler never clamps. Not worth warning about.
+    expect(analyzeClipMediaFit({ slotSeconds: 1.45, mediaSeconds: 1.433 })).toBeNull();
+  });
+
+  it("returns null when media is longer than or equal to the slot", () => {
+    expect(analyzeClipMediaFit({ slotSeconds: 2, mediaSeconds: 2 })).toBeNull();
+    expect(analyzeClipMediaFit({ slotSeconds: 2, mediaSeconds: 5 })).toBeNull();
+  });
+
+  it("reports the shortfall when the slot exceeds media beyond the clamp epsilon", () => {
+    const fit = analyzeClipMediaFit({ slotSeconds: 5, mediaSeconds: 1 });
+    expect(fit).not.toBeNull();
+    expect(fit?.shortfallSeconds).toBeCloseTo(4, 5);
+    expect(fit?.toleranceSeconds).toBeCloseTo(0.05, 5);
+  });
+
+  it("never flags looping clips (they repeat to fill the slot)", () => {
+    expect(analyzeClipMediaFit({ slotSeconds: 5, mediaSeconds: 1, loop: true })).toBeNull();
+  });
+
+  it("returns null for unusable inputs (non-finite media, zero slot)", () => {
+    expect(analyzeClipMediaFit({ slotSeconds: 0, mediaSeconds: 1 })).toBeNull();
+    expect(analyzeClipMediaFit({ slotSeconds: 5, mediaSeconds: NaN })).toBeNull();
+  });
 });
 
 describe("parseImageElements", () => {
@@ -307,6 +499,198 @@ describe("parseImageElements", () => {
     );
     expect(images[0]!.end).toBe(5);
   });
+});
+
+type Rgb = [number, number, number];
+
+const UI_FIXTURE_WIDTH = 240;
+const UI_FIXTURE_HEIGHT = 160;
+const RED_SAMPLE_PIXELS = [
+  [70, 72],
+  [118, 82],
+  [178, 92],
+] as const;
+
+function readFirstFramePixel(mediaPath: string, x: number, y: number): Rgb {
+  const result = spawnSync(
+    "ffmpeg",
+    [
+      "-v",
+      "error",
+      "-i",
+      mediaPath,
+      "-frames:v",
+      "1",
+      "-f",
+      "rawvideo",
+      "-pix_fmt",
+      "rgb24",
+      "pipe:1",
+    ],
+    { maxBuffer: UI_FIXTURE_WIDTH * UI_FIXTURE_HEIGHT * 3 + 1024 },
+  );
+  if (result.status !== 0) {
+    throw new Error(`ffmpeg pixel decode failed: ${result.stderr.toString().slice(-400)}`);
+  }
+
+  const offset = (y * UI_FIXTURE_WIDTH + x) * 3;
+  return [
+    result.stdout[offset] ?? 0,
+    result.stdout[offset + 1] ?? 0,
+    result.stdout[offset + 2] ?? 0,
+  ];
+}
+
+function maxChannelDelta(a: Rgb, b: Rgb): number {
+  return Math.max(Math.abs(a[0] - b[0]), Math.abs(a[1] - b[1]), Math.abs(a[2] - b[2]));
+}
+
+// Regression for saturated UI recordings: default JPEG extraction can shift
+// high-chroma reds before browser capture. Forcing PNG should keep extracted
+// source-video frames effectively identical to the decoded source pixels.
+describe.skipIf(!HAS_FFMPEG)("video frame extraction format", () => {
+  const FIXTURE_DIR = mkdtempSync(join(tmpdir(), "hf-video-frame-format-"));
+  const UI_FIXTURE = join(FIXTURE_DIR, "ui-red.mp4");
+
+  beforeAll(async () => {
+    const result = await runFfmpeg([
+      "-y",
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-f",
+      "lavfi",
+      "-i",
+      `color=c=0xffe7ee:s=${UI_FIXTURE_WIDTH}x${UI_FIXTURE_HEIGHT}:d=1:r=1`,
+      "-vf",
+      "drawbox=x=44:y=58:w=152:h=44:color=0xdd382e@1:t=fill,drawbox=x=64:y=75:w=112:h=10:color=0xfff0f0@1:t=fill",
+      "-c:v",
+      "libx264",
+      "-preset",
+      "ultrafast",
+      "-crf",
+      "0",
+      "-pix_fmt",
+      "yuv420p",
+      "-color_primaries",
+      "bt709",
+      "-color_trc",
+      "bt709",
+      "-colorspace",
+      "bt709",
+      UI_FIXTURE,
+    ]);
+    if (!result.success) {
+      throw new Error(`UI color fixture synthesis failed: ${result.stderr.slice(-400)}`);
+    }
+  }, 30_000);
+
+  afterAll(() => {
+    if (existsSync(FIXTURE_DIR)) rmSync(FIXTURE_DIR, { recursive: true, force: true });
+  });
+
+  function fixtureVideo(): VideoElement {
+    return {
+      id: "ui",
+      src: UI_FIXTURE,
+      start: 0,
+      end: 1,
+      mediaStart: 0,
+      loop: false,
+      hasAudio: false,
+    };
+  }
+
+  it("keeps color-sensitive UI reds closer to source when extraction is forced to png", async () => {
+    const defaultOut = join(FIXTURE_DIR, "out-default");
+    const pngOut = join(FIXTURE_DIR, "out-png");
+    mkdirSync(defaultOut, { recursive: true });
+    mkdirSync(pngOut, { recursive: true });
+
+    const defaultResult = await extractAllVideoFrames([fixtureVideo()], FIXTURE_DIR, {
+      fps: 1,
+      outputDir: defaultOut,
+    });
+    const pngResult = await extractAllVideoFrames([fixtureVideo()], FIXTURE_DIR, {
+      fps: 1,
+      outputDir: pngOut,
+      format: "png",
+    });
+
+    expect(defaultResult.errors).toEqual([]);
+    expect(pngResult.errors).toEqual([]);
+    const defaultFrame = defaultResult.extracted[0]!.framePaths.get(0)!;
+    const pngFrame = pngResult.extracted[0]!.framePaths.get(0)!;
+    expect(defaultFrame.endsWith(".jpg")).toBe(true);
+    expect(pngFrame.endsWith(".png")).toBe(true);
+
+    let worstDefaultDelta = 0;
+    let worstPngDelta = 0;
+    for (const [x, y] of RED_SAMPLE_PIXELS) {
+      const sourcePixel = readFirstFramePixel(UI_FIXTURE, x, y);
+      worstDefaultDelta = Math.max(
+        worstDefaultDelta,
+        maxChannelDelta(sourcePixel, readFirstFramePixel(defaultFrame, x, y)),
+      );
+      worstPngDelta = Math.max(
+        worstPngDelta,
+        maxChannelDelta(sourcePixel, readFirstFramePixel(pngFrame, x, y)),
+      );
+    }
+
+    expect(worstPngDelta).toBeLessThanOrEqual(5);
+    expect(worstPngDelta).toBeLessThanOrEqual(worstDefaultDelta);
+  }, 60_000);
+
+  it("keeps jpg and png extraction caches separate", async () => {
+    const cacheDir = mkdtempSync(join(tmpdir(), "hf-extract-format-cache-"));
+    try {
+      const defaultOut = join(FIXTURE_DIR, "cache-default");
+      const pngOut = join(FIXTURE_DIR, "cache-png");
+      const pngHitOut = join(FIXTURE_DIR, "cache-png-hit");
+      mkdirSync(defaultOut, { recursive: true });
+      mkdirSync(pngOut, { recursive: true });
+      mkdirSync(pngHitOut, { recursive: true });
+
+      const defaultResult = await extractAllVideoFrames(
+        [fixtureVideo()],
+        FIXTURE_DIR,
+        { fps: 1, outputDir: defaultOut },
+        undefined,
+        { extractCacheDir: cacheDir },
+      );
+      expect(defaultResult.errors).toEqual([]);
+      expect(defaultResult.phaseBreakdown.cacheHits).toBe(0);
+      expect(defaultResult.phaseBreakdown.cacheMisses).toBe(1);
+      expect(defaultResult.extracted[0]!.framePaths.get(0)!.endsWith(".jpg")).toBe(true);
+
+      const pngMiss = await extractAllVideoFrames(
+        [fixtureVideo()],
+        FIXTURE_DIR,
+        { fps: 1, outputDir: pngOut, format: "png" },
+        undefined,
+        { extractCacheDir: cacheDir },
+      );
+      expect(pngMiss.errors).toEqual([]);
+      expect(pngMiss.phaseBreakdown.cacheHits).toBe(0);
+      expect(pngMiss.phaseBreakdown.cacheMisses).toBe(1);
+      expect(pngMiss.extracted[0]!.framePaths.get(0)!.endsWith(".png")).toBe(true);
+
+      const pngHit = await extractAllVideoFrames(
+        [fixtureVideo()],
+        FIXTURE_DIR,
+        { fps: 1, outputDir: pngHitOut, format: "png" },
+        undefined,
+        { extractCacheDir: cacheDir },
+      );
+      expect(pngHit.errors).toEqual([]);
+      expect(pngHit.phaseBreakdown.cacheHits).toBe(1);
+      expect(pngHit.phaseBreakdown.cacheMisses).toBe(0);
+      expect(pngHit.extracted[0]!.framePaths.get(0)!.endsWith(".png")).toBe(true);
+    } finally {
+      rmSync(cacheDir, { recursive: true, force: true });
+    }
+  }, 60_000);
 });
 
 // Regression test for the VFR (variable frame rate) freeze bug.
@@ -395,8 +779,10 @@ describe.skipIf(!HAS_FFMPEG)("extractAllVideoFrames on a VFR source", () => {
     expect(result.extracted).toHaveLength(1);
     const frames = readdirSync(join(outputDir, "v1")).filter((f) => f.endsWith(".jpg"));
     // Pre-fix behavior produced ~90 frames (a 25% shortfall).
-    expect(frames.length).toBeGreaterThanOrEqual(119);
-    expect(frames.length).toBeLessThanOrEqual(121);
+    // ±3 tolerance: FFmpeg's VFR→CFR normalization yields slightly different
+    // frame counts across versions (timestamp rounding in the fps filter).
+    expect(frames.length).toBeGreaterThanOrEqual(117);
+    expect(frames.length).toBeLessThanOrEqual(123);
 
     expect(result.phaseBreakdown).toBeDefined();
     expect(result.phaseBreakdown.extractMs).toBeGreaterThan(0);
@@ -656,8 +1042,9 @@ describe.skipIf(!HAS_FFMPEG)("extractAllVideoFrames on a VFR source", () => {
     const frames = readdirSync(frameDir)
       .filter((f) => f.endsWith(".jpg"))
       .sort();
-    expect(frames.length).toBeGreaterThanOrEqual(299);
-    expect(frames.length).toBeLessThanOrEqual(301);
+    // ±3 tolerance: same FFmpeg VFR→CFR rounding variance as the mid-segment test.
+    expect(frames.length).toBeGreaterThanOrEqual(297);
+    expect(frames.length).toBeLessThanOrEqual(303);
 
     let prevHash: string | null = null;
     let duplicates = 0;
@@ -671,4 +1058,62 @@ describe.skipIf(!HAS_FFMPEG)("extractAllVideoFrames on a VFR source", () => {
     const duplicateRate = duplicates / frames.length;
     expect(duplicateRate).toBeLessThan(0.1);
   }, 60_000);
+});
+
+describe("getFrameAtTime — IEEE 754 boundary precision", () => {
+  function makeExtracted(fps: number, totalFrames: number): ExtractedFrames {
+    const framePaths = new Map<number, string>();
+    for (let i = 0; i < totalFrames; i++) framePaths.set(i, `frame-${i}.jpg`);
+    return {
+      fps,
+      totalFrames,
+      framePaths,
+      metadata: {
+        durationSeconds: totalFrames / fps,
+        width: 1920,
+        height: 1080,
+        codec: "h264",
+        hasAudio: false,
+        fps,
+      },
+    } as ExtractedFrames;
+  }
+
+  it("does not produce duplicate frames when data-start is grid-aligned", () => {
+    const extracted = makeExtracted(25, 351);
+    const videoStart = 0;
+    const seen: string[] = [];
+    let duplicates = 0;
+    for (let i = 0; i < 351; i++) {
+      const globalTime = i / 25;
+      const frame = getFrameAtTime(extracted, globalTime, videoStart);
+      if (frame && seen.length > 0 && frame === seen[seen.length - 1]) duplicates++;
+      if (frame) seen.push(frame);
+    }
+    expect(duplicates).toBe(0);
+  });
+
+  it("returns monotonically increasing frame indices", () => {
+    const extracted = makeExtracted(25, 100);
+    let lastIndex = -1;
+    for (let i = 0; i < 100; i++) {
+      const globalTime = i / 25;
+      const frame = getFrameAtTime(extracted, globalTime, 0);
+      const idx = frame ? parseInt(frame.split("-")[1]!) : -1;
+      expect(idx).toBeGreaterThan(lastIndex);
+      lastIndex = idx;
+    }
+  });
+
+  it("handles the 0.28 * 25 boundary case (6.999999 vs 7)", () => {
+    const extracted = makeExtracted(25, 10);
+    const frame = getFrameAtTime(extracted, 0.28, 0);
+    expect(frame).toBe("frame-7.jpg");
+  });
+
+  it("mediaStart does not offset frame index (extractor handles trim via -ss)", () => {
+    const extracted = makeExtracted(25, 100);
+    const frame = getFrameAtTime(extracted, 0, 0, false, 1.0);
+    expect(frame).toBe("frame-0.jpg");
+  });
 });

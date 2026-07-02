@@ -16,6 +16,29 @@ describe("compileTimingAttrs", () => {
     expect(unresolved).toHaveLength(0);
   });
 
+  it("injects a real id when the element has only data-hf-id (not a phantom match)", () => {
+    // Regression: getAttr(tag, "id") matched the trailing id="…" inside
+    // data-hf-id="…" and returned a phantom, so compileTag skipped its
+    // hf-video-N injection — leaving no real el.id and a blank-wash render.
+    const html = '<video data-hf-id="hf-bgvideo01" src="a.mp4" data-start="0" data-duration="2">';
+    const { html: compiled } = compileTimingAttrs(html);
+
+    expect(compiled).toContain('id="hf-video-0"');
+    expect(compiled).toContain('data-hf-id="hf-bgvideo01"');
+    expect(compiled).toContain('data-end="2"');
+  });
+
+  it("injects a real id on an audio element that has only data-hf-id", () => {
+    // Audio side of the same bug: the mixer selects `audio[id][src]`, so a
+    // phantom-id match meant the element was dropped (silent). compileTag must
+    // inject a real hf-audio-N so the mixer can find it.
+    const html = '<audio data-hf-id="hf-bgaudio01" src="a.mp3" data-start="0" data-duration="2">';
+    const { html: compiled } = compileTimingAttrs(html);
+
+    expect(compiled).toContain('id="hf-audio-0"');
+    expect(compiled).toContain('data-hf-id="hf-bgaudio01"');
+  });
+
   it("leaves data-end unchanged when already present", () => {
     const html = '<video id="v1" src="a.mp4" data-start="0" data-end="3">';
     const { html: compiled, unresolved } = compileTimingAttrs(html);
@@ -53,6 +76,32 @@ describe("compileTimingAttrs", () => {
     expect(unresolved[0].id).toBe("hf-video-0");
     expect(unresolved[0].tagName).toBe("video");
     expect(unresolved[0].start).toBe(1);
+  });
+
+  it("auto-injects data-start='0' when missing so video is discoverable", () => {
+    const html = '<video src="clip.mp4" muted>';
+    const { html: compiled, unresolved } = compileTimingAttrs(html);
+
+    expect(compiled).toContain('data-start="0"');
+    expect(compiled).toContain('id="hf-video-0"');
+    expect(unresolved).toHaveLength(1);
+    expect(unresolved[0].start).toBe(0);
+  });
+
+  it("marks auto-injected data-start with data-hf-auto-start sentinel", () => {
+    const html = '<video src="clip.mp4" muted>';
+    const { html: compiled } = compileTimingAttrs(html);
+
+    expect(compiled).toContain('data-start="0"');
+    expect(compiled).toContain("data-hf-auto-start");
+  });
+
+  it("does not add data-hf-auto-start when author provides data-start", () => {
+    const html = '<video id="v1" src="clip.mp4" data-start="5" muted>';
+    const { html: compiled } = compileTimingAttrs(html);
+
+    expect(compiled).toContain('data-start="5"');
+    expect(compiled).not.toContain("data-hf-auto-start");
   });
 
   it("compiles audio tags the same as video (minus data-has-audio)", () => {

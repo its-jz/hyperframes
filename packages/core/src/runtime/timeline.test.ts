@@ -7,7 +7,7 @@ describe("collectRuntimeTimelinePayload", () => {
     delete (window as any).__timelines;
   });
 
-  const defaultParams = { canonicalFps: 30, maxTimelineDurationSeconds: 1800 };
+  const defaultParams = { canonicalFps: 30 };
 
   it("returns minimal payload for empty document", () => {
     const result = collectRuntimeTimelinePayload(defaultParams);
@@ -18,6 +18,25 @@ describe("collectRuntimeTimelinePayload", () => {
     expect(result.durationInFrames).toBeGreaterThanOrEqual(1);
     expect(result.compositionWidth).toBe(1920);
     expect(result.compositionHeight).toBe(1080);
+  });
+
+  // Regression: id-less timed elements (root index.html children carry
+  // data-hf-id, not id) must get their data-hf-id as the clip id — not null —
+  // so the manifest aligns with __clipTree and inline expansion can join them.
+  it("ids an id-less clip by its data-hf-id", () => {
+    const root = document.createElement("div");
+    root.setAttribute("data-composition-id", "main");
+    root.setAttribute("data-duration", "10");
+    document.body.appendChild(root);
+
+    const clip = document.createElement("h1");
+    clip.setAttribute("data-hf-id", "hf-headline");
+    clip.setAttribute("data-start", "1");
+    clip.setAttribute("data-duration", "3");
+    root.appendChild(clip);
+
+    const result = collectRuntimeTimelinePayload(defaultParams);
+    expect(result.clips[0].id).toBe("hf-headline");
   });
 
   it("collects clips from elements with data-start and data-duration", () => {
@@ -183,6 +202,21 @@ describe("collectRuntimeTimelinePayload", () => {
     expect(result.durationInFrames).toBe(300); // 10s * 30fps
   });
 
+  it("ceil durationInFrames to match render frame count", () => {
+    const root = document.createElement("div");
+    root.setAttribute("data-composition-id", "main");
+    root.setAttribute("data-duration", "1.01");
+    document.body.appendChild(root);
+
+    const clip = document.createElement("div");
+    clip.setAttribute("data-start", "0");
+    clip.setAttribute("data-duration", "1.01");
+    root.appendChild(clip);
+
+    const result = collectRuntimeTimelinePayload(defaultParams);
+    expect(result.durationInFrames).toBe(31); // ceil(1.01s * 30fps), same as render.
+  });
+
   it("preserves the authored root duration when clips end earlier", () => {
     const root = document.createElement("div");
     root.setAttribute("data-composition-id", "main");
@@ -199,7 +233,7 @@ describe("collectRuntimeTimelinePayload", () => {
     expect(result.durationInFrames).toBe(210); // 7s * 30fps
   });
 
-  it("clamps duration to maxTimelineDurationSeconds", () => {
+  it("respects long composition durations without capping", () => {
     const root = document.createElement("div");
     root.setAttribute("data-composition-id", "main");
     root.setAttribute("data-duration", "5000");
@@ -210,11 +244,8 @@ describe("collectRuntimeTimelinePayload", () => {
     clip.setAttribute("data-duration", "5000");
     root.appendChild(clip);
 
-    const result = collectRuntimeTimelinePayload({
-      canonicalFps: 30,
-      maxTimelineDurationSeconds: 60,
-    });
-    expect(result.durationInFrames).toBeLessThanOrEqual(60 * 30);
+    const result = collectRuntimeTimelinePayload({ canonicalFps: 30 });
+    expect(result.durationInFrames).toBe(5000 * 30);
   });
 
   it("skips script/style/meta nodes", () => {

@@ -1,8 +1,34 @@
+// fallow-ignore-file code-duplication
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const producerState = vi.hoisted(() => ({
   createdJobs: [] as Array<Record<string, unknown>>,
   resolveConfigCalls: [] as Array<Record<string, unknown>>,
+}));
+
+const preflightState = vi.hoisted(() => ({
+  result: {
+    outcomes: [
+      { name: "FFmpeg", ok: true, level: "ok", detail: "/usr/bin/ffmpeg", path: "/usr/bin/ffmpeg" },
+      {
+        name: "FFprobe",
+        ok: true,
+        level: "ok",
+        detail: "/usr/bin/ffprobe",
+        path: "/usr/bin/ffprobe",
+      },
+      {
+        name: "Chrome",
+        ok: true,
+        level: "ok",
+        detail: "cache: /mock/chrome",
+        path: "/mock/chrome",
+      },
+    ],
+    ffmpegPath: "/usr/bin/ffmpeg",
+    ffprobePath: "/usr/bin/ffprobe",
+    browser: { executablePath: "/mock/chrome", source: "cache" },
+  },
 }));
 
 vi.mock("../utils/producer.js", () => ({
@@ -24,15 +50,22 @@ vi.mock("../telemetry/events.js", () => ({
   trackRenderError: vi.fn(),
 }));
 
+vi.mock("../browser/ffmpeg.js", () => ({
+  findFFmpeg: vi.fn(() => "/usr/bin/ffmpeg"),
+  getFFmpegInstallHint: vi.fn(() => "brew install ffmpeg"),
+}));
+
+vi.mock("../browser/preflight.js", () => ({
+  runEnvironmentChecks: vi.fn(async () => preflightState.result),
+}));
+
 describe("renderLocal browser GPU config", () => {
   const savedEnv = new Map<string, string | undefined>();
   // Pre-resolve once. The first dynamic `import("./render.js")` in this file
-  // takes >5 s on Windows runners (cold module load) — long enough to blow
-  // vitest's default 5 s timeout in whichever test happens to be first. When
-  // that test times out, its leaked late `createRenderJob` call lands AFTER
-  // the next test's `beforeEach` clears `producerState.createdJobs`, shifting
-  // index 0 and corrupting unrelated assertions. Importing once in
-  // `beforeAll` keeps every test fast and isolated.
+  // cold-loads a heavy module graph (core + engine + producer, incl. linkedom),
+  // slow under the parallel monorepo run — the generous hook timeout that
+  // absorbs that contention now lives in vitest.config.ts (shared by all CLI
+  // suites). Importing once in `beforeAll` keeps every test fast and isolated.
   let renderLocal: typeof import("./render.js").renderLocal;
   let resolveBrowserGpuForCli: typeof import("./render.js").resolveBrowserGpuForCli;
 
@@ -41,7 +74,7 @@ describe("renderLocal browser GPU config", () => {
   });
 
   function setEnv(key: string, value: string) {
-    savedEnv.set(key, process.env[key]);
+    if (!savedEnv.has(key)) savedEnv.set(key, process.env[key]);
     process.env[key] = value;
   }
 
@@ -49,6 +82,12 @@ describe("renderLocal browser GPU config", () => {
     producerState.createdJobs = [];
     producerState.resolveConfigCalls = [];
     savedEnv.clear();
+    savedEnv.set("HYPERFRAMES_FFMPEG_PATH", process.env.HYPERFRAMES_FFMPEG_PATH);
+    savedEnv.set("HYPERFRAMES_FFPROBE_PATH", process.env.HYPERFRAMES_FFPROBE_PATH);
+    savedEnv.set("PRODUCER_HEADLESS_SHELL_PATH", process.env.PRODUCER_HEADLESS_SHELL_PATH);
+    delete process.env.HYPERFRAMES_FFMPEG_PATH;
+    delete process.env.HYPERFRAMES_FFPROBE_PATH;
+    delete process.env.PRODUCER_HEADLESS_SHELL_PATH;
   });
 
   afterEach(() => {
@@ -68,7 +107,7 @@ describe("renderLocal browser GPU config", () => {
     setEnv("PRODUCER_BROWSER_GPU_MODE", "hardware");
 
     await renderLocal("/tmp/project", "/tmp/out.mp4", {
-      fps: 30,
+      fps: { num: 30, den: 1 },
       quality: "standard",
       format: "mp4",
       gpu: false,
@@ -86,7 +125,7 @@ describe("renderLocal browser GPU config", () => {
 
   it("forwards browserGpuMode='auto' into producer config (probe-then-choose)", async () => {
     await renderLocal("/tmp/project", "/tmp/out.mp4", {
-      fps: 30,
+      fps: { num: 30, den: 1 },
       quality: "standard",
       format: "mp4",
       gpu: false,
@@ -104,7 +143,7 @@ describe("renderLocal browser GPU config", () => {
 
   it("passes an explicit hardware override for default local browser GPU", async () => {
     await renderLocal("/tmp/project", "/tmp/out.mp4", {
-      fps: 30,
+      fps: { num: 30, den: 1 },
       quality: "standard",
       format: "mp4",
       gpu: false,
@@ -118,6 +157,22 @@ describe("renderLocal browser GPU config", () => {
       browserGpuMode: "hardware",
       resolved: true,
     });
+  });
+
+  it("passes preflight-resolved FFmpeg, FFprobe, and browser paths through env", async () => {
+    await renderLocal("/tmp/project", "/tmp/out.mp4", {
+      fps: { num: 30, den: 1 },
+      quality: "standard",
+      format: "mp4",
+      gpu: false,
+      browserGpuMode: "software",
+      hdrMode: "auto",
+      quiet: true,
+    });
+
+    expect(process.env.HYPERFRAMES_FFMPEG_PATH).toBe("/usr/bin/ffmpeg");
+    expect(process.env.HYPERFRAMES_FFPROBE_PATH).toBe("/usr/bin/ffprobe");
+    expect(process.env.PRODUCER_HEADLESS_SHELL_PATH).toBe("/mock/chrome");
   });
 
   it("resolves browser GPU from CLI flags, Docker mode, and env fallback", () => {
@@ -137,7 +192,7 @@ describe("renderLocal browser GPU config", () => {
 
   it("forwards parsed --variables payload to createRenderJob", async () => {
     await renderLocal("/tmp/project", "/tmp/out.mp4", {
-      fps: 30,
+      fps: { num: 30, den: 1 },
       quality: "standard",
       format: "mp4",
       gpu: false,
@@ -152,7 +207,7 @@ describe("renderLocal browser GPU config", () => {
 
   it("forwards format: png-sequence through to createRenderJob", async () => {
     await renderLocal("/tmp/project", "/tmp/frames", {
-      fps: 30,
+      fps: { num: 30, den: 1 },
       quality: "standard",
       format: "png-sequence",
       gpu: false,
@@ -164,9 +219,55 @@ describe("renderLocal browser GPU config", () => {
     expect(producerState.createdJobs[0]?.format).toBe("png-sequence");
   });
 
+  it("forwards format: gif and gifLoop through to createRenderJob", async () => {
+    await renderLocal("/tmp/project", "/tmp/demo.gif", {
+      fps: { num: 15, den: 1 },
+      quality: "standard",
+      format: "gif",
+      gifLoop: 3,
+      gpu: false,
+      browserGpuMode: "software",
+      hdrMode: "auto",
+      quiet: true,
+    });
+
+    expect(producerState.createdJobs[0]?.format).toBe("gif");
+    expect(producerState.createdJobs[0]?.gifLoop).toBe(3);
+  });
+
+  it("forwards videoFrameFormat to createRenderJob", async () => {
+    await renderLocal("/tmp/project", "/tmp/out.mp4", {
+      fps: { num: 30, den: 1 },
+      quality: "standard",
+      format: "mp4",
+      gpu: false,
+      browserGpuMode: "software",
+      hdrMode: "auto",
+      quiet: true,
+      videoFrameFormat: "png",
+    });
+
+    expect(producerState.createdJobs[0]?.videoFrameFormat).toBe("png");
+  });
+
+  it("forwards debug mode to createRenderJob", async () => {
+    await renderLocal("/tmp/project", "/tmp/out.mp4", {
+      fps: { num: 30, den: 1 },
+      quality: "standard",
+      format: "mp4",
+      gpu: false,
+      browserGpuMode: "software",
+      hdrMode: "auto",
+      quiet: true,
+      debug: true,
+    });
+
+    expect(producerState.createdJobs[0]?.debug).toBe(true);
+  });
+
   it("omits variables from createRenderJob when not provided", async () => {
     await renderLocal("/tmp/project", "/tmp/out.mp4", {
-      fps: 30,
+      fps: { num: 30, den: 1 },
       quality: "standard",
       format: "mp4",
       gpu: false,
@@ -180,7 +281,7 @@ describe("renderLocal browser GPU config", () => {
 
   it("forwards entryFile to createRenderJob when --composition is set", async () => {
     await renderLocal("/tmp/project", "/tmp/out.mp4", {
-      fps: 30,
+      fps: { num: 30, den: 1 },
       quality: "standard",
       format: "mp4",
       gpu: false,
@@ -195,7 +296,7 @@ describe("renderLocal browser GPU config", () => {
 
   it("omits entryFile from createRenderJob when --composition is not set", async () => {
     await renderLocal("/tmp/project", "/tmp/out.mp4", {
-      fps: 30,
+      fps: { num: 30, den: 1 },
       quality: "standard",
       format: "mp4",
       gpu: false,
@@ -207,9 +308,61 @@ describe("renderLocal browser GPU config", () => {
     expect(producerState.createdJobs[0]?.entryFile).toBeUndefined();
   });
 
+  it("forwards --browser-timeout into resolveConfig as pageNavigationTimeout (ms)", async () => {
+    await renderLocal("/tmp/project", "/tmp/out.mp4", {
+      fps: { num: 30, den: 1 },
+      quality: "standard",
+      format: "mp4",
+      gpu: false,
+      browserGpuMode: "software",
+      hdrMode: "auto",
+      quiet: true,
+      pageNavigationTimeoutMs: 180_000,
+    });
+
+    expect(producerState.resolveConfigCalls[0]).toMatchObject({
+      pageNavigationTimeout: 180_000,
+    });
+  });
+
+  it("forwards vp9CpuUsed into resolveConfig when set", async () => {
+    await renderLocal("/tmp/project", "/tmp/out.webm", {
+      fps: { num: 30, den: 1 },
+      quality: "standard",
+      format: "webm",
+      gpu: false,
+      browserGpuMode: "software",
+      hdrMode: "auto",
+      quiet: true,
+      vp9CpuUsed: 2,
+    });
+
+    expect(producerState.resolveConfigCalls[0]).toMatchObject({
+      vp9CpuUsed: 2,
+    });
+  });
+
+  it("omits pageNavigationTimeout from resolveConfig when --browser-timeout is not set", async () => {
+    await renderLocal("/tmp/project", "/tmp/out.mp4", {
+      fps: { num: 30, den: 1 },
+      quality: "standard",
+      format: "mp4",
+      gpu: false,
+      browserGpuMode: "software",
+      hdrMode: "auto",
+      quiet: true,
+    });
+
+    // Issue #1199: when the flag is omitted, the engine's DEFAULT_CONFIG must
+    // own the navigation timeout. Forwarding `undefined` would override
+    // `pageNavigationTimeout: 60_000` to `undefined` and re-introduce the
+    // bug in a different shape.
+    expect(producerState.resolveConfigCalls[0]).not.toHaveProperty("pageNavigationTimeout");
+  });
+
   it("forwards outputResolution to createRenderJob when --resolution is set", async () => {
     await renderLocal("/tmp/project", "/tmp/out.mp4", {
-      fps: 30,
+      fps: { num: 30, den: 1 },
       quality: "standard",
       format: "mp4",
       gpu: false,
@@ -224,7 +377,7 @@ describe("renderLocal browser GPU config", () => {
 
   it("omits outputResolution from createRenderJob by default", async () => {
     await renderLocal("/tmp/project", "/tmp/out.mp4", {
-      fps: 30,
+      fps: { num: 30, den: 1 },
       quality: "standard",
       format: "mp4",
       gpu: false,
@@ -245,7 +398,7 @@ describe("renderLocal browser GPU config", () => {
       });
 
     await renderLocal("/tmp/project", "/tmp/out.mp4", {
-      fps: 30,
+      fps: { num: 30, den: 1 },
       quality: "standard",
       format: "mp4",
       gpu: false,
@@ -261,143 +414,96 @@ describe("renderLocal browser GPU config", () => {
   });
 });
 
-describe("parseVariablesArg", () => {
-  let parseVariablesArg: typeof import("./render.js").parseVariablesArg;
+describe("checkRenderResolutionPreflight", () => {
+  let checkRenderResolutionPreflight: typeof import("./render.js").checkRenderResolutionPreflight;
 
+  // Cold-imports render.js (heavy graph); the generous hook timeout for parallel
+  // CI contention lives in vitest.config.ts. See the note above.
   beforeAll(async () => {
-    ({ parseVariablesArg } = await import("./render.js"));
+    ({ checkRenderResolutionPreflight } = await import("./render.js"));
   });
 
-  function expectErr<T extends { kind: string }>(
-    result: import("./render.js").VariablesParseResult,
-  ): T {
-    if (result.ok) throw new Error(`expected error, got ${JSON.stringify(result.value)}`);
-    return result.error as T;
-  }
+  // Dims must be read the same way the producer's compiler reads them:
+  // `data-width` / `data-height` on the `[data-composition-id]` root.
+  const comp = (w: number, h: number) =>
+    `<html><body><div data-composition-id="root" data-width="${w}" data-height="${h}"></div></body></html>`;
+  const portraitHtml = comp(1080, 1920);
+  const landscapeHtml = comp(1920, 1080);
+  const noModes = { alphaRequested: false, hdrRequested: false } as const;
 
-  it("returns undefined when neither flag is set", () => {
-    expect(parseVariablesArg(undefined, undefined)).toEqual({ ok: true, value: undefined });
+  it("returns undefined when no outputResolution is requested", async () => {
+    expect(await checkRenderResolutionPreflight(portraitHtml, undefined, noModes)).toBeUndefined();
   });
 
-  it("parses inline JSON object", () => {
-    expect(parseVariablesArg('{"title":"Hello","n":3}', undefined)).toEqual({
-      ok: true,
-      value: { title: "Hello", n: 3 },
-    });
+  it("returns undefined when the preset matches the composition orientation", async () => {
+    expect(await checkRenderResolutionPreflight(portraitHtml, "portrait", noModes)).toBeUndefined();
   });
 
-  it("parses file JSON via injected reader", () => {
-    const fakeReader = (path: string) => {
-      if (path === "vars.json") return '{"theme":"dark"}';
-      throw new Error("unexpected path");
-    };
-    expect(parseVariablesArg(undefined, "vars.json", fakeReader)).toEqual({
-      ok: true,
-      value: { theme: "dark" },
-    });
+  it("returns a suggestion + aspect-mismatch kind when a landscape preset is used on a portrait composition", async () => {
+    const result = await checkRenderResolutionPreflight(portraitHtml, "landscape", noModes);
+    expect(result?.message).toContain("--resolution portrait");
+    expect(result?.kind).toBe("aspect-mismatch");
   });
 
-  it("rejects when both flags are set", () => {
-    const err = expectErr(parseVariablesArg('{"a":1}', "vars.json"));
-    expect(err).toEqual({ kind: "conflict" });
+  it("suggests landscape for a landscape composition rendered with a portrait preset", async () => {
+    const result = await checkRenderResolutionPreflight(landscapeHtml, "portrait", noModes);
+    expect(result?.message).toContain("--resolution landscape");
   });
 
-  it("rejects unparseable JSON with a source-aware kind", () => {
-    expect(expectErr(parseVariablesArg("{not json", undefined))).toMatchObject({
-      kind: "parse-error",
-      source: "inline",
-    });
-    expect(expectErr(parseVariablesArg(undefined, "x", () => "{not json"))).toMatchObject({
-      kind: "parse-error",
-      source: "file",
-    });
+  it("preserves the 4K tier when suggesting a matching preset (square comp + landscape-4k → square-4k)", async () => {
+    // Tier-aware suggestion is the load-bearing new behavior; square-4k is the
+    // preset that only surfaces via a same-tier swap, so guard it explicitly.
+    const result = await checkRenderResolutionPreflight(comp(2160, 2160), "landscape-4k", noModes);
+    expect(result?.message).toContain("--resolution square-4k");
   });
 
-  it("rejects non-object payloads (array, string, null, number)", () => {
-    for (const payload of ["[1,2]", '"hello"', "null", "42"]) {
-      expect(expectErr(parseVariablesArg(payload, undefined))).toEqual({ kind: "shape-error" });
-    }
-  });
-
-  it("surfaces filesystem errors from --variables-file", () => {
-    const err = expectErr<{
-      kind: "read-error";
-      path: string;
-      cause: string;
-    }>(
-      parseVariablesArg(undefined, "missing.json", () => {
-        throw new Error("ENOENT: no such file");
-      }),
-    );
-    expect(err.kind).toBe("read-error");
-    expect(err.path).toBe("missing.json");
-    expect(err.cause).toMatch(/ENOENT/);
-  });
-});
-
-describe("validateVariablesAgainstProject", () => {
-  let validateVariablesAgainstProject: typeof import("./render.js").validateVariablesAgainstProject;
-  let tmpDir: string;
-  let mkdtempSync: typeof import("node:fs").mkdtempSync;
-  let writeFileSync: typeof import("node:fs").writeFileSync;
-  let rmSync: typeof import("node:fs").rmSync;
-  let join: typeof import("node:path").join;
-  let tmpdir: typeof import("node:os").tmpdir;
-
-  beforeAll(async () => {
-    ({ validateVariablesAgainstProject } = await import("./render.js"));
-    ({ mkdtempSync, writeFileSync, rmSync } = await import("node:fs"));
-    ({ join } = await import("node:path"));
-    ({ tmpdir } = await import("node:os"));
-  });
-
-  beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), "hf-validate-vars-"));
-  });
-
-  afterEach(() => {
-    rmSync(tmpDir, { recursive: true, force: true });
-  });
-
-  function writeIndex(html: string): string {
-    const path = join(tmpDir, "index.html");
-    writeFileSync(path, html);
-    return path;
-  }
-
-  it("returns [] when the project has no data-composition-variables declarations", () => {
-    const indexPath = writeIndex(`<html><body><div data-composition-id="x"></div></body></html>`);
-    expect(validateVariablesAgainstProject(indexPath, { title: "Hello" })).toEqual([]);
-  });
-
-  it("returns [] when every value matches its declaration", () => {
-    const indexPath = writeIndex(
-      `<html data-composition-variables='[{"id":"title","type":"string","label":"Title","default":"x"}]'><body><div data-composition-id="root"></div></body></html>`,
-    );
-    expect(validateVariablesAgainstProject(indexPath, { title: "Hello" })).toEqual([]);
-  });
-
-  it("flags undeclared keys", () => {
-    const indexPath = writeIndex(
-      `<html data-composition-variables='[{"id":"title","type":"string","label":"Title","default":"x"}]'><body><div data-composition-id="root"></div></body></html>`,
-    );
-    expect(validateVariablesAgainstProject(indexPath, { title: "Hello", extra: 1 })).toEqual([
-      { kind: "undeclared", variableId: "extra" },
-    ]);
-  });
-
-  it("flags type mismatches", () => {
-    const indexPath = writeIndex(
-      `<html data-composition-variables='[{"id":"count","type":"number","label":"Count","default":0}]'><body><div data-composition-id="root"></div></body></html>`,
-    );
-    expect(validateVariablesAgainstProject(indexPath, { count: "three" })).toEqual([
-      { kind: "type-mismatch", variableId: "count", expected: "number", actual: "string" },
-    ]);
-  });
-
-  it("returns [] when the index file cannot be read (lint owns that diagnostic)", () => {
+  it("does not false-abort a landscape registry-block composition (data-width/height, no data-resolution)", async () => {
+    // Regression guard: registry blocks carry data-width/height and no
+    // data-resolution — a preset-snapping heuristic would misread this as
+    // portrait and wrongly reject the correct --resolution landscape.
     expect(
-      validateVariablesAgainstProject(join(tmpDir, "missing.html"), { title: "Hello" }),
-    ).toEqual([]);
+      await checkRenderResolutionPreflight(landscapeHtml, "landscape", noModes),
+    ).toBeUndefined();
+  });
+
+  it("flags alpha output combined with outputResolution", async () => {
+    const result = await checkRenderResolutionPreflight(landscapeHtml, "landscape-4k", {
+      alphaRequested: true,
+      hdrRequested: false,
+    });
+    expect(result?.message).toContain("alpha output");
+    expect(result?.kind).toBe("alpha-incompatible");
+  });
+
+  // The three remaining kinds share the same rejection sink (→ one emit each);
+  // guard their classification so the telemetry dimension stays accurate.
+  it("classifies an HDR + outputResolution combination as hdr-incompatible", async () => {
+    const result = await checkRenderResolutionPreflight(landscapeHtml, "landscape", {
+      alphaRequested: false,
+      hdrRequested: true,
+    });
+    expect(result?.kind).toBe("hdr-incompatible");
+  });
+
+  it("classifies a preset smaller than the composition as downsampling", async () => {
+    // 3840×2160 comp + landscape (1920×1080): same 16:9 aspect, target smaller.
+    const result = await checkRenderResolutionPreflight(comp(3840, 2160), "landscape", noModes);
+    expect(result?.kind).toBe("downsampling");
+  });
+
+  it("classifies a non-integer upscale as non-integer-scale", async () => {
+    // 1280×720 comp + landscape (1920×1080): same 16:9 aspect, 1.5× scale.
+    const result = await checkRenderResolutionPreflight(comp(1280, 720), "landscape", noModes);
+    expect(result?.kind).toBe("non-integer-scale");
+  });
+
+  it("returns undefined when composition dimensions can't be determined (defers to the pipeline)", async () => {
+    // No [data-composition-id] root / no data-width/height → defer, never guess.
+    expect(await checkRenderResolutionPreflight("", "landscape", noModes)).toBeUndefined();
+    expect(
+      await checkRenderResolutionPreflight("<html><body></body></html>", "landscape", noModes),
+    ).toBeUndefined();
   });
 });
+
+// Variables-helper tests live in `../utils/variables.test.ts`.

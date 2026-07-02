@@ -1,3 +1,4 @@
+// fallow-ignore-file unused-class-member code-duplication complexity
 /**
  * Video Frame Extractor Service
  *
@@ -9,6 +10,8 @@ import { spawn } from "child_process";
 import { existsSync, mkdirSync, readdirSync, rmSync } from "fs";
 import { isAbsolute, join, posix, resolve, sep } from "path";
 import { parseHTML } from "linkedom";
+import { decodeUrlPathVariants, MEDIA_DURATION_CLAMP_EPSILON_SECONDS } from "@hyperframes/core";
+import { trackChildProcess } from "../utils/processTracker.js";
 import { extractMediaMetadata, type VideoMetadata } from "../utils/ffprobe.js";
 import {
   analyzeCompositionHdr,
@@ -17,6 +20,7 @@ import {
 } from "../utils/hdr.js";
 import { downloadToTemp, isHttpUrl } from "../utils/urlDownloader.js";
 import { runFfmpeg } from "../utils/runFfmpeg.js";
+import { getFfmpegBinary } from "../utils/ffmpegBinaries.js";
 import { DEFAULT_CONFIG, type EngineConfig } from "../config.js";
 import { unwrapTemplate } from "../utils/htmlTemplate.js";
 import {
@@ -57,11 +61,25 @@ export interface ExtractedFrames {
   ownedByLookup?: boolean;
 }
 
+/**
+ * The single source of truth for the source-video frame-extraction allow-list.
+ * The CLI flag parser, the producer HTTP server, and the distributed-config
+ * validator all validate against this same set via {@link isVideoFrameFormat}
+ * so the boundaries can't drift when a new format is added.
+ */
+export const VIDEO_FRAME_FORMATS = ["auto", "jpg", "png"] as const;
+export type VideoFrameFormat = (typeof VIDEO_FRAME_FORMATS)[number];
+
+/** Runtime guard for {@link VideoFrameFormat} over an untrusted value. */
+export function isVideoFrameFormat(value: unknown): value is VideoFrameFormat {
+  return typeof value === "string" && (VIDEO_FRAME_FORMATS as readonly string[]).includes(value);
+}
+
 export interface ExtractionOptions {
   fps: number;
   outputDir: string;
   quality?: number;
-  format?: "jpg" | "png";
+  format?: VideoFrameFormat;
 }
 
 /**
@@ -257,7 +275,8 @@ export async function extractVideoFramesRange(
   args.push("-y", outputPattern);
 
   return new Promise((resolve, reject) => {
-    const ffmpeg = spawn("ffmpeg", args);
+    const ffmpeg = spawn(getFfmpegBinary(), args);
+    trackChildProcess(ffmpeg);
     let stderr = "";
     const onAbort = () => {
       ffmpeg.kill("SIGTERM");
@@ -428,9 +447,12 @@ export function decoderForCodec(codec: string | undefined): string {
   return c;
 }
 
-function resolveFrameFormat(metadata: VideoMetadata, requested?: "jpg" | "png"): CacheFrameFormat {
-  if (requested) return requested;
+export function resolveFrameFormat(
+  metadata: VideoMetadata,
+  requested?: VideoFrameFormat,
+): CacheFrameFormat {
   if (metadata.hasAlpha || codecMayHaveAlpha(metadata.videoCodec)) return "png";
+  if (requested === "png" || requested === "jpg") return requested;
   return "jpg";
 }
 
@@ -512,30 +534,41 @@ export function resolveProjectRelativeSrc(
   baseDir: string,
   compiledDir?: string,
 ): string {
-  const fromCompiled = compiledDir ? join(compiledDir, src) : null;
-  const fromBase = join(baseDir, src);
+  const qIdx = src.indexOf("?");
+  const cleanSrc = qIdx >= 0 ? src.slice(0, qIdx) : src;
   const candidates: string[] = [];
-  if (fromCompiled) candidates.push(fromCompiled);
-  candidates.push(fromBase);
-  // If the joined result escapes the project root (either via leading `..`
-  // or mid-path traversal that path.join collapsed past baseDir), retry
-  // with the basename re-anchored at the project root. This mirrors the
-  // browser URL clamp without relying on a particular `..` shape.
-  const baseAbs = resolve(baseDir);
-  const fromBaseAbs = resolve(fromBase);
-  if (!fromBaseAbs.startsWith(baseAbs + sep) && fromBaseAbs !== baseAbs) {
-    // Normalize first (`assets/../../assets/foo.mp4` → `../assets/foo.mp4`)
-    // then strip any remaining leading `..` segments. Stripping `..` from the
-    // raw input would leave dangling siblings (`assets/../../assets/foo`
-    // would become `assets/assets/foo` instead of `assets/foo`).
-    const normalized = posix.normalize(src.replace(/\\/g, "/"));
-    const stripped = normalized.replace(/^(\.\.\/)+/, "");
-    if (stripped && stripped !== src && !stripped.startsWith("..")) {
-      if (compiledDir) candidates.push(join(compiledDir, stripped));
-      candidates.push(join(baseDir, stripped));
+
+  const addCandidate = (candidate: string): void => {
+    if (!candidates.includes(candidate)) candidates.push(candidate);
+  };
+
+  for (const variant of decodeUrlPathVariants(cleanSrc)) {
+    const fromCompiled = compiledDir ? join(compiledDir, variant) : null;
+    const fromBase = join(baseDir, variant);
+
+    // If the joined result escapes the project root (either via leading `..`
+    // or mid-path traversal that path.join collapsed past baseDir), retry
+    // with the basename re-anchored at the project root. This mirrors the
+    // browser URL clamp without relying on a particular `..` shape.
+    const baseAbs = resolve(baseDir);
+    const fromBaseAbs = resolve(fromBase);
+    if (!fromBaseAbs.startsWith(baseAbs + sep) && fromBaseAbs !== baseAbs) {
+      // Normalize first (`assets/../../assets/foo.mp4` → `../assets/foo.mp4`)
+      // then strip any remaining leading `..` segments. Stripping `..` from the
+      // raw input would leave dangling siblings (`assets/../../assets/foo`
+      // would become `assets/assets/foo` instead of `assets/foo`).
+      const normalized = posix.normalize(variant.replace(/\\/g, "/"));
+      const stripped = normalized.replace(/^(\.\.\/)+/, "");
+      if (stripped && stripped !== variant && !stripped.startsWith("..")) {
+        if (compiledDir) addCandidate(join(compiledDir, stripped));
+        addCandidate(join(baseDir, stripped));
+      }
     }
+
+    if (fromCompiled) addCandidate(fromCompiled);
+    addCandidate(fromBase);
   }
-  return candidates.find(existsSync) ?? fromBase;
+  return candidates.find(existsSync) ?? join(baseDir, cleanSrc);
 }
 
 export async function extractAllVideoFrames(
@@ -920,12 +953,40 @@ export function getFrameAtTime(
   if (loop && loopDuration > 0 && localTime >= loopDuration) {
     localTime %= loopDuration;
   }
-  const frameIndex = Math.floor(localTime * extracted.fps);
+  // Add epsilon before flooring to avoid IEEE 754 boundary errors where
+  // e.g. 0.28 * 25 === 6.999999999999999 instead of 7.
+  const frameIndex = Math.floor(localTime * extracted.fps + 1e-9);
   if (loop && frameIndex >= extracted.totalFrames && extracted.totalFrames > 0) {
     return extracted.framePaths.get(extracted.totalFrames - 1) || null;
   }
   if (frameIndex < 0 || frameIndex >= extracted.totalFrames) return null;
   return extracted.framePaths.get(frameIndex) || null;
+}
+
+const HOLD_LAST_FRAME_TOLERANCE_FRAMES = 2;
+
+/**
+ * Whether a clip's source is shorter than its `data-duration` slot by more than
+ * the compiler tolerates before clamping the slot to the media
+ * (MEDIA_DURATION_CLAMP_EPSILON_SECONDS) — the case worth warning about. Shared
+ * by the render and `validate` warnings. `null` when the media covers the slot,
+ * the clip loops, or inputs are unusable.
+ */
+export function analyzeClipMediaFit(params: {
+  /** Timeline slot length in seconds — `end - start` (a.k.a. data-duration). */
+  slotSeconds: number;
+  /** Playable source media after the trim offset — `duration - mediaStart`. */
+  mediaSeconds: number;
+  /** Looping clips repeat to fill the slot, so they never fall short. */
+  loop?: boolean;
+}): { shortfallSeconds: number; toleranceSeconds: number } | null {
+  const { slotSeconds, mediaSeconds, loop } = params;
+  if (loop) return null;
+  if (!(slotSeconds > 0) || !Number.isFinite(mediaSeconds) || mediaSeconds < 0) return null;
+  const toleranceSeconds = MEDIA_DURATION_CLAMP_EPSILON_SECONDS;
+  const shortfallSeconds = slotSeconds - mediaSeconds;
+  if (shortfallSeconds <= toleranceSeconds) return null;
+  return { shortfallSeconds, toleranceSeconds };
 }
 
 export class FrameLookupTable {
@@ -968,7 +1029,7 @@ export class FrameLookupTable {
   getFrame(videoId: string, globalTime: number): string | null {
     const video = this.videos.get(videoId);
     if (!video) return null;
-    if (globalTime < video.start || globalTime >= video.end) return null;
+    if (globalTime < video.start || globalTime > video.end) return null;
     return getFrameAtTime(video.extracted, globalTime, video.start, video.loop, video.mediaStart);
   }
 
@@ -979,11 +1040,16 @@ export class FrameLookupTable {
   }
 
   private refreshActiveSet(globalTime: number): void {
+    // The active window is [start, end] INCLUSIVE of the end, mirroring the
+    // runtime's element-visibility contract (core/runtime init.ts keeps an
+    // element visible through `currentTime <= end`). An exclusive end-bound
+    // here deactivated the video one frame early, so the frame landing exactly
+    // on a clip's end rendered blank while the runtime still showed it.
     if (this.lastTime == null || globalTime < this.lastTime) {
       this.activeVideoIds.clear();
       this.startCursor = 0;
       for (const entry of this.orderedVideos) {
-        if (entry.start <= globalTime && globalTime < entry.end) {
+        if (entry.start <= globalTime && globalTime <= entry.end) {
           this.activeVideoIds.add(entry.videoId);
         }
         if (entry.start <= globalTime) {
@@ -1002,7 +1068,7 @@ export class FrameLookupTable {
       if (candidate.start > globalTime) {
         break;
       }
-      if (globalTime < candidate.end) {
+      if (globalTime <= candidate.end) {
         this.activeVideoIds.add(candidate.videoId);
       }
       this.startCursor += 1;
@@ -1010,7 +1076,7 @@ export class FrameLookupTable {
 
     for (const videoId of Array.from(this.activeVideoIds)) {
       const video = this.videos.get(videoId);
-      if (!video || globalTime < video.start || globalTime >= video.end) {
+      if (!video || globalTime < video.start || globalTime > video.end) {
         this.activeVideoIds.delete(videoId);
       }
     }
@@ -1030,7 +1096,7 @@ export class FrameLookupTable {
       if (video.loop && loopDuration > 0 && localTime >= loopDuration) {
         localTime %= loopDuration;
       }
-      const frameIndex = Math.floor(localTime * video.extracted.fps);
+      const frameIndex = Math.floor(localTime * video.extracted.fps + 1e-9);
       if (video.loop && frameIndex >= video.extracted.totalFrames) {
         const framePath = video.extracted.framePaths.get(video.extracted.totalFrames - 1);
         if (framePath) {
@@ -1038,7 +1104,24 @@ export class FrameLookupTable {
         }
         continue;
       }
-      if (frameIndex < 0 || frameIndex >= video.extracted.totalFrames) continue;
+      if (frameIndex < 0 || frameIndex >= video.extracted.totalFrames) {
+        // Source exhausted. Hold the last frame near the clip end so a media that
+        // falls a hair short of its slot (e.g. `ffmpeg -t 1.45` → 1.433s at 30fps)
+        // doesn't flash the background for one frame. A clip that's substantially
+        // shorter than its slot still blanks for the tail. Tolerance floored at
+        // the clamp epsilon so the seam is covered at any fps (see that const).
+        const fps = video.extracted.fps;
+        const holdTolerance = Math.max(
+          fps > 0 ? HOLD_LAST_FRAME_TOLERANCE_FRAMES / fps : 0,
+          MEDIA_DURATION_CLAMP_EPSILON_SECONDS,
+        );
+        if (globalTime >= video.end - holdTolerance && video.extracted.totalFrames > 0) {
+          const lastIndex = video.extracted.totalFrames - 1;
+          const lastPath = video.extracted.framePaths.get(lastIndex);
+          if (lastPath) frames.set(videoId, { framePath: lastPath, frameIndex: lastIndex });
+        }
+        continue;
+      }
       const framePath = video.extracted.framePaths.get(frameIndex);
       if (!framePath) continue;
       frames.set(videoId, { framePath, frameIndex });

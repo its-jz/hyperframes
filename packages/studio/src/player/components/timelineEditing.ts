@@ -1,10 +1,7 @@
 import { formatTime } from "../lib/time";
+import { roundToCenti } from "../../utils/rounding";
 
-const TIME_PRECISION = 100;
-
-function roundToCentiseconds(value: number): number {
-  return Math.round(value * TIME_PRECISION) / TIME_PRECISION;
-}
+const roundToCentiseconds = roundToCenti;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
@@ -114,10 +111,32 @@ export function resolveTimelineMove(
   };
 }
 
-export function buildTrackZIndexMap(tracks: number[]): Map<number, number> {
-  const uniqueTracks = Array.from(new Set(tracks)).sort((a, b) => a - b);
-  const maxZIndex = uniqueTracks.length;
-  return new Map(uniqueTracks.map((track, index) => [track, maxZIndex - index]));
+/**
+ * Snap a keyframe's clip-relative percentage to the nearest beat within ~8px,
+ * mapping through composition time (pct → time → nearest beat → pct). Returns
+ * the percentage unchanged when no beat is in range, so dragging stays free
+ * between beats.
+ */
+export function snapKeyframePctToBeat(
+  el: { start: number; duration: number },
+  pct: number,
+  beatTimes: number[] | undefined,
+  pixelsPerSecond: number,
+): number {
+  if (!beatTimes || beatTimes.length === 0 || el.duration <= 0) return pct;
+  const t = el.start + (pct / 100) * el.duration;
+  const snapSecs = 8 / Math.max(pixelsPerSecond, 1);
+  let best = t;
+  let bestDist = snapSecs;
+  for (const bt of beatTimes) {
+    const d = Math.abs(bt - t);
+    if (d < bestDist) {
+      bestDist = d;
+      best = bt;
+    }
+  }
+  if (best === t) return pct;
+  return Math.max(0, Math.min(100, ((best - el.start) / el.duration) * 100));
 }
 
 export function resolveTimelineResize(
@@ -207,18 +226,6 @@ export function hasPatchableTimelineTarget(input: { domId?: string; selector?: s
   return Boolean(input.domId || input.selector);
 }
 
-export function canOffsetTrimClipStart(input: {
-  tag: string;
-  playbackStart?: number;
-  playbackStartAttr?: "media-start" | "playback-start";
-  sourceDuration?: number;
-}): boolean {
-  if (input.playbackStartAttr != null) return true;
-  if (input.playbackStart != null) return true;
-  const normalizedTag = input.tag.toLowerCase();
-  return ["video", "audio"].includes(normalizedTag);
-}
-
 export function getTimelineEditCapabilities(input: {
   tag: string;
   duration: number;
@@ -228,14 +235,24 @@ export function getTimelineEditCapabilities(input: {
   playbackStart?: number;
   playbackStartAttr?: "media-start" | "playback-start";
   sourceDuration?: number;
+  timingSource?: "authored" | "implicit";
+  timelineLocked?: boolean;
 }): TimelineEditCapabilities {
+  if (input.timingSource === "implicit" || input.timelineLocked) {
+    return {
+      canMove: false,
+      canTrimStart: false,
+      canTrimEnd: false,
+    };
+  }
+
   const canPatch = hasPatchableTimelineTarget(input);
   const hasFiniteDuration = Number.isFinite(input.duration) && input.duration > 0;
   const hasDeterministicWindow = isDeterministicTimelineWindow(input);
   return {
-    canMove: canPatch && hasDeterministicWindow,
-    canTrimEnd: canPatch && hasFiniteDuration && hasDeterministicWindow,
-    canTrimStart: canPatch && hasFiniteDuration && canOffsetTrimClipStart(input),
+    canMove: canPatch && (hasDeterministicWindow || hasFiniteDuration),
+    canTrimEnd: canPatch && hasFiniteDuration,
+    canTrimStart: canPatch && hasFiniteDuration,
   };
 }
 
@@ -273,7 +290,6 @@ export function buildClipRangeSelection(
     anchorY: anchor.anchorY,
   };
 }
-
 export function buildTimelineAgentPrompt({
   rangeStart,
   rangeEnd,
@@ -347,7 +363,6 @@ export function buildTimelineElementAgentPrompt(element: {
 
   return lines.join("\n");
 }
-
 export function formatTimelineAttributeNumber(value: number): string {
   return Number(roundToCentiseconds(value).toFixed(2)).toString();
 }

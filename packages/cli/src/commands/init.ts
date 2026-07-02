@@ -10,7 +10,10 @@ export const examples: Example[] = [
   ["Start from an audio file", "hyperframes init my-video --audio track.mp3"],
   ["Scaffold with Tailwind CSS", "hyperframes init my-video --example blank --tailwind"],
   ["Non-interactive mode (for CI or AI agents)", "hyperframes init my-video --non-interactive"],
-  ["Skip AI coding skills installation", "hyperframes init my-video --skip-skills"],
+  [
+    "Opt out of the GitHub skills check (CI/tests only)",
+    "HYPERFRAMES_SKIP_SKILLS=1 hyperframes init my-video --non-interactive",
+  ],
 ];
 import {
   existsSync,
@@ -35,6 +38,7 @@ import {
 import { fetchRemoteTemplate } from "../templates/remote.js";
 import { trackInitTemplate } from "../telemetry/events.js";
 import { hasFFmpeg } from "../whisper/manager.js";
+import { findFFmpeg, findFFprobe, getFFmpegInstallHint } from "../browser/ffmpeg.js";
 import { VERSION } from "../version.js";
 import {
   CANVAS_DIMENSIONS,
@@ -75,8 +79,10 @@ const TAILWIND_BROWSER_INTEGRITY =
 
 function probeVideo(filePath: string): VideoMeta | undefined {
   try {
+    const ffprobePath = findFFprobe();
+    if (!ffprobePath) return undefined;
     const raw = execFileSync(
-      "ffprobe",
+      ffprobePath,
       ["-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", filePath],
       { encoding: "utf-8", timeout: 15_000 },
     );
@@ -134,8 +140,13 @@ function isWebCompatible(codec: string): boolean {
 
 function transcodeToMp4(inputPath: string, outputPath: string): Promise<boolean> {
   return new Promise((resolvePromise) => {
+    const ffmpegPath = findFFmpeg();
+    if (!ffmpegPath) {
+      resolvePromise(false);
+      return;
+    }
     const child = spawn(
-      "ffmpeg",
+      ffmpegPath,
       [
         "-i",
         inputPath,
@@ -174,10 +185,16 @@ function resolveAssetDir(devSegments: string[], builtSegments: string[]): string
 
 // Resolves bundled templates shipped inside the CLI package
 // (packages/cli/src/templates/<id> in dev, dist/templates/<id> when packed).
-// Not to be confused with the repo-root registry/examples/ directory, which
-// is fetched remotely via fetchRemoteTemplate.
+// Dev-mode also checks registry/examples/<id> so that smoke CI tests pick up
+// PR-branch template changes before the PR is merged to main.
 function getStaticTemplateDir(templateId: string): string {
-  return resolveAssetDir(["..", "templates", templateId], ["templates", templateId]);
+  const base = dirname(fileURLToPath(import.meta.url));
+  const devPath = resolve(base, "..", "templates", templateId);
+  if (existsSync(devPath)) return devPath;
+  // fallback: repo-root registry/examples/<id> (4 levels up from src/commands/)
+  const registryPath = resolve(base, "..", "..", "..", "..", "registry", "examples", templateId);
+  if (existsSync(registryPath)) return registryPath;
+  return resolve(base, "templates", templateId);
 }
 
 function getSharedTemplateDir(): string {
@@ -296,7 +313,7 @@ function patchVideoSrc(
 ): void {
   const htmlFiles = readdirSync(dir, { withFileTypes: true, recursive: true })
     .filter((e) => e.isFile() && e.name.endsWith(".html"))
-    .map((e) => join(e.parentPath ?? e.path, e.name));
+    .map((e) => join(e.parentPath, e.name));
 
   for (const file of htmlFiles) {
     let content = readFileSync(file, "utf-8");
@@ -345,8 +362,7 @@ async function handleVideoFile(
       );
     }
   } else {
-    const msg =
-      "ffprobe not found — using defaults (1920x1080, 5s, 30fps). Install: brew install ffmpeg";
+    const msg = `ffprobe not found — using defaults (1920x1080, 5s, 30fps). Install: ${getFFmpegInstallHint()}`;
     if (interactive) {
       clack.log.warn(msg);
     } else {
@@ -409,10 +425,10 @@ async function handleVideoFile(
     } else {
       if (interactive) {
         clack.log.warn(c.dim("ffmpeg not installed — cannot transcode."));
-        clack.log.info(c.accent("Install: brew install ffmpeg"));
+        clack.log.info(c.accent(`Install: ${getFFmpegInstallHint()}`));
       } else {
         console.log(c.warn("ffmpeg not installed — cannot transcode. Copying original."));
-        console.log(c.dim("Install: ") + c.accent("brew install ffmpeg"));
+        console.log(c.dim("Install: ") + c.accent(getFFmpegInstallHint()));
       }
       copyFileSync(videoPath, resolve(destDir, localVideoName));
     }
@@ -510,9 +526,11 @@ async function scaffoldProject(
 ): Promise<void> {
   mkdirSync(destDir, { recursive: true });
 
-  // Use bundled template if available, otherwise fetch from GitHub
+  // Use bundled template if available, otherwise fetch from GitHub.
+  // Check for index.html inside the dir — an empty directory left by the
+  // build toolchain should not prevent the remote fetch fallback.
   const templateDir = getStaticTemplateDir(templateId);
-  if (existsSync(templateDir)) {
+  if (existsSync(join(templateDir, "index.html"))) {
     cpSync(templateDir, destDir, { recursive: true });
   } else {
     await fetchRemoteTemplate(templateId, destDir);
@@ -558,6 +576,52 @@ async function scaffoldProject(
   }
 }
 
+/**
+ * Ensure the AI coding skills are present and current. Checks the installed
+ * skills against the latest published on GitHub and only (re)installs when
+ * something is outdated or missing — so re-running `init` on an up-to-date
+ * machine is a no-op. Best-effort: if the version check can't reach GitHub, it
+ * installs anyway. The install itself (`installAllSkills`) installs the full set
+ * once GLOBALLY (~/.claude/skills + ~/.agents/skills) and mirrors it into every
+ * other installed agent, so it is project-independent — the check is global-first
+ * to match.
+ */
+async function ensureSkillsCurrent(destDir: string): Promise<void> {
+  const { installAllSkills } = await import("./skills.js");
+  const { checkSkills } = await import("../utils/skillsManifest.js");
+
+  console.log();
+  console.log(c.bold("Checking AI coding skills against GitHub..."));
+  let needsInstall = true;
+  try {
+    const result = await checkSkills({ cwd: destDir });
+    needsInstall = result.updateAvailable;
+  } catch {
+    // Couldn't reach GitHub (offline, rate-limited) — install anyway.
+  }
+
+  if (needsInstall) {
+    // installAllSkills installs the full set once globally and mirrors it into
+    // every installed agent's global dir — project-independent, so a freshly
+    // scaffolded project doesn't need any agent folders yet.
+    //
+    // Best-effort: installAllSkills (non-strict here) already swallows its own
+    // failures, but now that --skip-skills no longer escapes this path every
+    // init runs it — including offline ones, where checkSkills throws and we
+    // fall through to "install anyway". Wrap defensively so a skills-install
+    // failure can never break `init` itself; it only warns and proceeds.
+    try {
+      await installAllSkills({ cwd: destDir });
+    } catch (err) {
+      console.log(
+        c.dim(`AI coding skills install skipped: ${err instanceof Error ? err.message : err}`),
+      );
+    }
+  } else {
+    console.log(c.success("AI coding skills are already up to date."));
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Exported command
 // ---------------------------------------------------------------------------
@@ -588,7 +652,13 @@ export default defineCommand({
     video: {
       type: "string",
       description: "Path to a video file (MP4, WebM, MOV)",
+      alias: "v",
+    },
+    "video-legacy": {
+      type: "string",
+      description: "[renamed] Use --video (or -v) instead of -V.",
       alias: "V",
+      hidden: true,
     },
     audio: {
       type: "string",
@@ -615,7 +685,8 @@ export default defineCommand({
     },
     "skip-skills": {
       type: "boolean",
-      description: "Skip AI coding skills installation",
+      description:
+        "[temporarily ignored] init always checks AI skills against GitHub while the skills.sh registry catches up; set HYPERFRAMES_SKIP_SKILLS=1 to opt out (CI/tests)",
     },
     tailwind: {
       type: "boolean",
@@ -624,7 +695,7 @@ export default defineCommand({
     resolution: {
       type: "string",
       description:
-        "Canvas resolution preset: landscape (1920x1080), portrait (1080x1920), landscape-4k (3840x2160), portrait-4k (2160x3840). Aliases: 1080p, 4k, uhd. Default: keep template dimensions (typically 1920x1080).",
+        "Canvas resolution preset: landscape (1920x1080), portrait (1080x1920), landscape-4k (3840x2160), portrait-4k (2160x3840), square (1080x1080), square-4k (2160x2160). Aliases: 1080p, 4k, uhd, 1080p-square, square-1080p, 4k-square. Default: keep template dimensions (typically 1920x1080).",
     },
   },
   async run({ args }) {
@@ -638,16 +709,43 @@ export default defineCommand({
       );
       process.exit(1);
     }
+    if (args["video-legacy"] !== undefined) {
+      console.error(
+        c.error(
+          `The -V short flag no longer maps to --video. Use --video (or -v). Example:\n  npx hyperframes init ${args.name ?? "my-video"} --video "${args["video-legacy"]}"`,
+        ),
+      );
+      process.exit(1);
+    }
     const exampleFlag = args.example;
     const videoFlag = args.video;
     const audioFlag = args.audio;
     const skipTranscribe = args["skip-transcribe"] === true;
-    const skipSkills = args["skip-skills"] === true;
+    // Temporary measure while the skills.sh registry sync lags GitHub main: the
+    // `--skip-skills` FLAG is neutered so an agent (or user) that passes it can
+    // NOT dodge the GitHub skills freshness check. The "don't pass --skip-skills"
+    // guidance lives in SKILL.md, which ships through the same laggy skills.sh
+    // channel and can't be relied on to reach the agent — so the guarantee has to
+    // live in the CLI, the one channel that updates promptly (`npx
+    // hyperframes@latest`). CI and unit tests still opt out via the
+    // HYPERFRAMES_SKIP_SKILLS=1 env var, which the agent/user CLI path never sets.
+    // Revert to `args["skip-skills"] === true` once skills.sh catches up.
+    const skipSkills = process.env.HYPERFRAMES_SKIP_SKILLS === "1";
+    const skipSkillsFlagIgnored = args["skip-skills"] === true && !skipSkills;
     const tailwind = args.tailwind === true;
     const nonInteractive = args["non-interactive"] === true;
     const modelFlag = args.model;
     const languageFlag = args.language;
     const interactive = !nonInteractive && process.stdout.isTTY === true;
+
+    if (skipSkillsFlagIgnored) {
+      console.log(
+        c.dim(
+          "Note: --skip-skills is temporarily ignored — init always checks AI skills " +
+            "against GitHub while the skills.sh registry catches up.",
+        ),
+      );
+    }
 
     let resolutionPreset: CanvasResolution | undefined;
     if (args.resolution !== undefined) {
@@ -656,7 +754,8 @@ export default defineCommand({
         console.error(
           c.error(
             `Invalid --resolution: "${args.resolution}". ` +
-              `Use one of: landscape, portrait, landscape-4k, portrait-4k (or aliases 1080p, 4k, uhd).`,
+              `Use one of: landscape, portrait, landscape-4k, portrait-4k, square, square-4k ` +
+              `(or aliases 1080p, 4k, uhd, 1080p-square, square-1080p, 4k-square).`,
           ),
         );
         process.exit(1);
@@ -676,24 +775,33 @@ export default defineCommand({
         process.exit(1);
       }
 
+      if (videoFlag && audioFlag) {
+        console.error(c.error("Cannot use --video and --audio together"));
+        process.exit(1);
+      }
+
+      // Validate source files before creating destDir so a failed run does
+      // not leave an empty orphan directory behind. The interactive path
+      // already validates in this order.
+      const videoPath = videoFlag ? resolve(videoFlag) : undefined;
+      if (videoPath && !existsSync(videoPath)) {
+        console.error(c.error(`Video file not found: ${videoFlag}`));
+        process.exit(1);
+      }
+      const audioPath = audioFlag ? resolve(audioFlag) : undefined;
+      if (audioPath && !existsSync(audioPath)) {
+        console.error(c.error(`Audio file not found: ${audioFlag}`));
+        process.exit(1);
+      }
+
       mkdirSync(destDir, { recursive: true });
 
       let localVideoName: string | undefined;
       let videoDuration: number | undefined;
       let sourceFilePath: string | undefined;
 
-      if (videoFlag && audioFlag) {
-        console.error(c.error("Cannot use --video and --audio together"));
-        process.exit(1);
-      }
-
       // Handle video
-      if (videoFlag) {
-        const videoPath = resolve(videoFlag);
-        if (!existsSync(videoPath)) {
-          console.error(c.error(`Video file not found: ${videoFlag}`));
-          process.exit(1);
-        }
+      if (videoPath) {
         sourceFilePath = videoPath;
         const result = await handleVideoFile(videoPath, destDir, false);
         localVideoName = result.localVideoName;
@@ -704,12 +812,7 @@ export default defineCommand({
       }
 
       // Handle audio
-      if (audioFlag) {
-        const audioPath = resolve(audioFlag);
-        if (!existsSync(audioPath)) {
-          console.error(c.error(`Audio file not found: ${audioFlag}`));
-          process.exit(1);
-        }
+      if (audioPath) {
         sourceFilePath = audioPath;
         copyFileSync(audioPath, resolve(destDir, basename(audioPath)));
         console.log(`Audio: ${basename(audioPath)}`);
@@ -766,11 +869,22 @@ export default defineCommand({
       for (const f of readdirSync(destDir).filter((f) => !f.startsWith("."))) {
         console.log(`  ${c.accent(f)}`);
       }
+
+      if (!skipSkills) {
+        await ensureSkillsCurrent(destDir);
+      }
+
       console.log();
       console.log("Get started:");
       console.log();
-      console.log(`  ${c.accent("1.")} Install AI coding skills (one-time):`);
-      console.log(`     ${c.accent("npx skills add heygen-com/hyperframes")}`);
+      if (skipSkills) {
+        console.log(`  ${c.accent("1.")} Install AI coding skills (one-time):`);
+        console.log(`     ${c.accent("npx hyperframes skills update")}`);
+      } else {
+        console.log(
+          `  ${c.accent("1.")} Restart your AI agent (new session) so it loads the skills.`,
+        );
+      }
       console.log();
       console.log(`  ${c.accent("2.")} Open this project with your AI coding agent:`);
       console.log(
@@ -973,20 +1087,11 @@ export default defineCommand({
     const files = readdirSync(destDir);
     clack.note(files.map((f) => c.accent(f)).join("\n"), c.success(`Created ${name}/`));
 
-    // Offer to install AI coding skills
+    // Check skills against GitHub and (re)install only if outdated or missing —
+    // init is the one place the full set is pulled. The --skip-skills flag is
+    // temporarily neutered (see above); CI/tests opt out via HYPERFRAMES_SKIP_SKILLS=1.
     if (!skipSkills) {
-      const installSkills = await clack.confirm({
-        message: "Install AI coding skills? (for Claude Code, Cursor, Codex, etc.)",
-        initialValue: true,
-      });
-      if (clack.isCancel(installSkills)) {
-        clack.cancel("Setup cancelled.");
-        process.exit(0);
-      }
-      if (installSkills) {
-        const skillsCmd = await import("./skills.js").then((m) => m.default);
-        await runCommand(skillsCmd, { rawArgs: [] });
-      }
+      await ensureSkillsCurrent(destDir);
     }
 
     // Auto-launch studio preview

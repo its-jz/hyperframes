@@ -43,12 +43,29 @@ export type {
 } from "./types.js";
 
 // ── Configuration ──────────────────────────────────────────────────────────────
-export { resolveConfig, DEFAULT_CONFIG, type EngineConfig } from "./config.js";
+export {
+  resolveConfig,
+  DEFAULT_CONFIG,
+  scaleProtocolTimeoutForComposition,
+  type EngineConfig,
+} from "./config.js";
+export {
+  DEFAULT_VP9_CPU_USED,
+  MAX_VP9_CPU_USED,
+  MIN_VP9_CPU_USED,
+  normalizeVp9CpuUsed,
+} from "./services/vp9Options.js";
+export {
+  getSystemTotalMb,
+  isLowMemorySystem,
+  LOW_MEMORY_TOTAL_MB_THRESHOLD,
+} from "./services/systemMemory.js";
 
 // ── Browser management ─────────────────────────────────────────────────────────
 export {
   acquireBrowser,
   releaseBrowser,
+  drainBrowserPool,
   resolveHeadlessShellPath,
   resolveBrowserGpuMode,
   buildChromeArgs,
@@ -65,11 +82,15 @@ export {
   closeCaptureSession,
   captureFrame,
   captureFrameToBuffer,
+  discardWarmupCapture,
   getCompositionDuration,
   getCapturePerfSummary,
   prepareCaptureSessionForReuse,
   type CaptureSession,
+  isTransientBrowserError,
+  isMemoryExhaustionError,
   type BeforeCaptureHook,
+  type DiscardWarmupInnerCapture,
 } from "./services/frameCapture.js";
 
 // ── Screenshot (BeginFrame) ─────────────────────────────────────────────────────
@@ -90,6 +111,7 @@ export {
 
 // ── Encoding ───────────────────────────────────────────────────────────────────
 export {
+  buildEncoderArgs,
   encodeFramesFromDir,
   encodeFramesChunkedConcat,
   muxVideoWithAudio,
@@ -120,18 +142,27 @@ export {
   getFrameAtTime,
   createFrameLookupTable,
   FrameLookupTable,
+  analyzeClipMediaFit,
   type VideoElement,
   type ImageElement,
   type ExtractedFrames,
   type ExtractionOptions,
   type ExtractionResult,
   type ExtractionPhaseBreakdown,
+  type VideoFrameFormat,
+  VIDEO_FRAME_FORMATS,
+  isVideoFrameFormat,
 } from "./services/videoFrameExtractor.js";
 
 export { createVideoFrameInjector } from "./services/videoFrameInjector.js";
 
 export { parseAudioElements, processCompositionAudio } from "./services/audioMixer.js";
-export type { AudioElement, AudioTrack, MixResult } from "./services/audioMixer.types.js";
+export type {
+  AudioElement,
+  AudioTrack,
+  AudioVolumeKeyframe,
+  MixResult,
+} from "./services/audioMixer.types.js";
 
 // ── Parallel rendering ─────────────────────────────────────────────────────────
 export {
@@ -156,6 +187,15 @@ export {
 export { quantizeTimeToFrame, MEDIA_VISUAL_STYLE_PROPERTIES } from "@hyperframes/core";
 
 export {
+  assertSwiftShader,
+  readWebGlVendorInfo,
+  SwiftShaderAssertionError,
+  BROWSER_GPU_NOT_SOFTWARE,
+} from "./utils/assertSwiftShader.js";
+
+export { readWebGlVendorInfoFromCanvas } from "./utils/readWebGlVendorInfoFromCanvas.js";
+
+export {
   extractMediaMetadata,
   extractVideoMetadata,
   extractAudioMetadata,
@@ -165,8 +205,22 @@ export {
   type KeyframeAnalysis,
 } from "./utils/ffprobe.js";
 
-export { downloadToTemp, isHttpUrl } from "./utils/urlDownloader.js";
-export { runFfmpeg, type RunFfmpegOptions, type RunFfmpegResult } from "./utils/runFfmpeg.js";
+export { assertPublicHttpsUrl, downloadToTemp, isHttpUrl } from "./utils/urlDownloader.js";
+export {
+  runFfmpeg,
+  formatFfmpegError,
+  type RunFfmpegOptions,
+  type RunFfmpegResult,
+} from "./utils/runFfmpeg.js";
+export {
+  assertConfiguredFfmpegBinariesExist,
+  getFfmpegBinary,
+  getFfprobeBinary,
+  FFMPEG_PATH_ENV,
+  FFPROBE_PATH_ENV,
+} from "./utils/ffmpegBinaries.js";
+
+export { trackChildProcess, killTrackedProcesses } from "./utils/processTracker.js";
 
 export {
   decodePng,

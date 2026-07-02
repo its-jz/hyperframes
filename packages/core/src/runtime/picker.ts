@@ -17,6 +17,7 @@ const PICKER_BLOCK_SELECTOR = [
   "[data-hyperframes-picker-block]",
   "[data-hyper-shader-loading]",
 ].join(",");
+const COLOR_GRADING_SOURCE_HIDDEN_ATTR = "data-hf-color-grading-source-hidden";
 
 export type PickerModule = {
   enablePickMode: () => void;
@@ -58,12 +59,33 @@ export function createPickerModule(deps: PickerModuleDeps): PickerModule {
     });
   }
 
+  function isEffectivelyHidden(el: HTMLElement): boolean {
+    const win = el.ownerDocument.defaultView;
+    if (!win) return false;
+    let current: HTMLElement | null = el;
+    while (current && current !== document.body && current !== document.documentElement) {
+      const computed = win.getComputedStyle(current);
+      if (computed.display === "none" || computed.visibility === "hidden") return true;
+      if (computed.pointerEvents === "none") return true;
+      const opacity = Number.parseFloat(computed.opacity);
+      if (
+        Number.isFinite(opacity) &&
+        opacity <= 0.01 &&
+        !current.hasAttribute(COLOR_GRADING_SOURCE_HIDDEN_ATTR)
+      )
+        return true;
+      current = current.parentElement;
+    }
+    return false;
+  }
+
   function isPickableElement(el: Element | null): el is Element {
     if (!el || el === document.body || el === document.documentElement) return false;
     const tag = el.tagName.toLowerCase();
     if (tag === "script" || tag === "style" || tag === "link" || tag === "meta") return false;
     if (el.classList.contains("__hf-pick-highlight")) return false;
     if (el.closest(PICKER_IGNORE_SELECTOR)) return false;
+    if (isEffectivelyHidden(el as HTMLElement)) return false;
     return true;
   }
 
@@ -75,11 +97,11 @@ export function createPickerModule(deps: PickerModuleDeps): PickerModule {
     const htmlEl = el as HTMLElement;
     if (htmlEl.id) return `#${htmlEl.id}`;
     const compositionId = el.getAttribute("data-composition-id");
-    if (compositionId) return `[data-composition-id="${compositionId}"]`;
+    if (compositionId) return `[data-composition-id="${CSS.escape(compositionId)}"]`;
     const compositionSrc = el.getAttribute("data-composition-src");
-    if (compositionSrc) return `[data-composition-src="${compositionSrc}"]`;
+    if (compositionSrc) return `[data-composition-src="${CSS.escape(compositionSrc)}"]`;
     const track = el.getAttribute("data-track-index");
-    if (track) return `[data-track-index="${track}"]`;
+    if (track) return `[data-track-index="${CSS.escape(track)}"]`;
     const tag = el.tagName.toLowerCase();
     const parent = el.parentElement;
     if (!parent) return tag;

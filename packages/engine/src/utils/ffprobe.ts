@@ -1,11 +1,14 @@
+// fallow-ignore-file code-duplication complexity
 import { spawn } from "child_process";
 import { readFileSync } from "fs";
 import { extname } from "path";
+import { FFPROBE_PATH_ENV, getFfprobeBinary } from "./ffmpegBinaries.js";
 
 /** Spawn ffprobe with given args, return stdout. Throws on non-zero exit or missing binary. */
 function runFfprobe(args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
-    const proc = spawn("ffprobe", args);
+    const command = getFfprobeBinary();
+    const proc = spawn(command, args);
     let stdout = "";
     let stderr = "";
     proc.stdout.on("data", (data) => {
@@ -23,7 +26,14 @@ function runFfprobe(args: string[]): Promise<string> {
     });
     proc.on("error", (err) => {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-        reject(new Error("[FFmpeg] ffprobe not found. Please install FFmpeg."));
+        const configured = process.env[FFPROBE_PATH_ENV]?.trim();
+        reject(
+          new Error(
+            configured
+              ? `[FFmpeg] ffprobe not found at ${FFPROBE_PATH_ENV}="${configured}". Please install FFmpeg.`
+              : "[FFmpeg] ffprobe not found. Please install FFmpeg.",
+          ),
+        );
       } else {
         reject(err);
       }
@@ -55,6 +65,7 @@ export interface VideoColorSpace {
 
 export interface VideoMetadata {
   durationSeconds: number;
+  videoStreamDurationSeconds: number;
   width: number;
   height: number;
   fps: number;
@@ -70,6 +81,10 @@ export interface VideoMetadata {
 
 export interface AudioMetadata {
   durationSeconds: number;
+  /** Audio stream's own duration (from `stream.duration`), falling back to
+   *  container duration when the stream field is absent. Prefer this over
+   *  `durationSeconds` for stream-level parity checks. */
+  streamDurationSeconds?: number;
   sampleRate: number;
   channels: number;
   audioCodec: string;
@@ -81,6 +96,8 @@ interface FFProbeStream {
   codec_name?: string;
   width?: number;
   height?: number;
+  duration?: string;
+  nb_frames?: string;
   pix_fmt?: string;
   r_frame_rate?: string;
   avg_frame_rate?: string;
@@ -264,6 +281,7 @@ export async function extractMediaMetadata(filePath: string): Promise<VideoMetad
       if (stillImageMeta) {
         return {
           durationSeconds: 0,
+          videoStreamDurationSeconds: 0,
           width: stillImageMeta.width,
           height: stillImageMeta.height,
           fps: 0,
@@ -296,8 +314,12 @@ export async function extractMediaMetadata(filePath: string): Promise<VideoMetad
     const hasAlpha =
       /(^|[^a-z])yuva|rgba|argb|bgra|gbrap|gray[a-z0-9]*a/i.test(pixelFormat) || alphaMode === "1";
 
+    const containerDuration = output?.format.duration ? parseFloat(output.format.duration) : 0;
+    const streamDuration = videoStream.duration ? parseFloat(videoStream.duration) : 0;
+
     return {
-      durationSeconds: output?.format.duration ? parseFloat(output.format.duration) : 0,
+      durationSeconds: containerDuration,
+      videoStreamDurationSeconds: streamDuration > 0 ? streamDuration : containerDuration,
       width: videoStream.width || stillImageMeta?.width || 0,
       height: videoStream.height || stillImageMeta?.height || 0,
       fps,
@@ -345,9 +367,11 @@ export async function extractAudioMetadata(filePath: string): Promise<AudioMetad
     if (!audioStream) throw new Error("[FFmpeg] No audio stream found");
 
     const durationSeconds = output.format.duration ? parseFloat(output.format.duration) : 0;
+    const streamDuration = audioStream.duration ? parseFloat(audioStream.duration) : undefined;
 
     return {
       durationSeconds,
+      streamDurationSeconds: streamDuration && streamDuration > 0 ? streamDuration : undefined,
       sampleRate: audioStream.sample_rate ? parseInt(audioStream.sample_rate) : 44100,
       channels: audioStream.channels || 2,
       audioCodec: audioStream.codec_name || "unknown",

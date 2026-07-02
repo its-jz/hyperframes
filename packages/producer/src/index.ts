@@ -12,11 +12,20 @@ export {
   executeRenderJob,
   RenderCancelledError,
   type RenderConfig,
+  type RenderConfigInput,
   type RenderJob,
   type RenderStatus,
   type RenderPerfSummary,
   type ProgressCallback,
 } from "./services/renderOrchestrator.js";
+export {
+  type BrowserDiagnosticSummary,
+  type RenderCaptureObservability,
+  type RenderObservabilitySummary,
+  type RenderObservationData,
+  type RenderObservationEvent,
+  type RenderObservationStatus,
+} from "./services/render/observability.js";
 
 // ── Frame capture (lower-level) ─────────────────────────────────────────────
 export {
@@ -43,7 +52,7 @@ export {
 } from "./services/fileServer.js";
 
 // ── Video frame injection (Hyperframes-specific hook) ───────────────────────
-export { createVideoFrameInjector } from "./services/videoFrameInjector.js";
+export { createVideoFrameInjector } from "@hyperframes/engine";
 
 // ── Configuration ───────────────────────────────────────────────────────────
 export { resolveConfig, DEFAULT_CONFIG, type ProducerConfig } from "./config.js";
@@ -67,6 +76,7 @@ export {
 } from "./server.js";
 
 // ── Utilities ───────────────────────────────────────────────────────────────
+export { normalizeErrorMessage } from "./utils/errorMessage.js";
 export { quantizeTimeToFrame } from "./utils/parityContract.js";
 export { resolveRenderPaths, type RenderPaths } from "./utils/paths.js";
 
@@ -75,3 +85,18 @@ export {
   runHyperframeLint,
   type PreparedHyperframeLintInput,
 } from "./services/hyperframeLint.js";
+
+// ── Distributed render primitives ───────────────────────────────────────────
+// The full surface lives at `@hyperframes/producer/distributed`; we
+// additionally re-export the three activity functions + their result
+// types here so callers that pin `@hyperframes/producer` don't need a
+// separate subpath import.
+export {
+  assemble,
+  plan,
+  renderChunk,
+  type AssembleResult,
+  type ChunkResult,
+  type DistributedRenderConfig,
+  type PlanResult,
+} from "./distributed.js";

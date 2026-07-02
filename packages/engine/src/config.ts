@@ -6,6 +6,13 @@
  * fallbacks for backward compatibility during migration.
  */
 
+import {
+  getSystemTotalMb,
+  isLowMemorySystem,
+  LOW_MEMORY_TOTAL_MB_THRESHOLD,
+} from "./services/systemMemory.js";
+import { DEFAULT_VP9_CPU_USED, normalizeVp9CpuUsed } from "./services/vp9Options.js";
+
 /**
  * Full engine configuration. All fields are wired through the config
  * object; env vars serve as backward-compatible fallbacks resolved
@@ -48,8 +55,58 @@ export interface EngineConfig {
   expectedChromiumMajor?: number;
   /** Force screenshot capture mode (skip BeginFrame even on Linux). */
   forceScreenshot: boolean;
+  /**
+   * Static-frame dedup: reuse byte-identical frames instead of re-seeking +
+   * re-screenshotting (anchor-verified at init). Default ON; disable via
+   * `HF_STATIC_DEDUP` in {false,0,off}. Only arms in screenshot capture mode.
+   */
+  staticFrameDedup: boolean;
+  /**
+   * Low-memory render profile. When `true`, the orchestrator collapses the
+   * pipeline to its cheapest shape on memory-constrained hosts: it skips the
+   * throwaway auto-worker calibration browser, pins capture to a single
+   * worker (unless the user passed an explicit `--workers`), and prefers
+   * screenshot capture over BeginFrame. Resolved automatically from total
+   * RAM (`isLowMemorySystem()`); force on/off via `PRODUCER_LOW_MEMORY_MODE`
+   * or the `--low-memory-mode` CLI flag.
+   */
+  lowMemoryMode: boolean;
+  /**
+   * Opt-in: page-side shader-transition compositing.
+   *
+   * When `true`, shader transitions for SDR compositions run their blend
+   * inside Chrome via WebGL on a page-side compositor canvas instead of
+   * Node-side per-pixel blending (the hf#677 layered pipeline). The engine
+   * then captures ONE opaque RGB frame per output frame via the streaming
+   * capture path, skipping per-scene transparent screenshots and the
+   * Node-side shader-blend worker pool entirely.
+   *
+   * The feature stacks on top of the hf#677 chain — it does not undo it.
+   * When this flag is OFF (the default), behaviour is byte-identical to the
+   * current path. When ON and the composition has no shader transitions or
+   * has HDR content (which forces the layered path regardless), this flag
+   * is a no-op.
+   *
+   * Mac viability: Chrome on Mac accelerates page-side WebGL canvases via
+   * Metal/CoreAnimation natively. This is the lever for Mac users who
+   * cannot use `--enable-begin-frame-control` (Chromium structural limit,
+   * crbug.com/40656275).
+   *
+   * Determinism: page-side WebGL is f32, not f64. Byte-equality fixture
+   * pins are NOT compatible with this path; the new path's correctness
+   * pin is PSNR-based. Default OFF preserves the existing pins for the
+   * hf#677 chain.
+   *
+   * Env fallback: `HF_PAGE_SIDE_COMPOSITING=true`.
+   */
+  enablePageSideCompositing: boolean;
 
   // ── Encoding ─────────────────────────────────────────────────────────
+  /**
+   * libvpx-vp9 speed/quality tradeoff. Higher values encode faster with a
+   * larger quality/size tradeoff. FFmpeg accepts integer values from -8 to 8.
+   */
+  vp9CpuUsed: number;
   enableChunkedEncode: boolean;
   chunkSizeFrames: number;
   enableStreamingEncode: boolean;
@@ -65,7 +122,12 @@ export interface EngineConfig {
   ffmpegEncodeTimeout: number;
   /** Timeout for FFmpeg mux/faststart processes (ms). Default: 300_000 */
   ffmpegProcessTimeout: number;
-  /** Timeout for FFmpeg streaming encode (ms). Default: 600_000 */
+  /**
+   * Inactivity timeout for FFmpeg streaming encode (ms). The timer resets on
+   * every successful `writeFrame` call, so this caps the duration of a
+   * single "no frame arrived" gap (capture hang, dead Chrome), not the total
+   * render time. Default: 600_000 (10 minutes without any frame = dead).
+   */
   ffmpegStreamingTimeout: number;
 
   // ── HDR ──────────────────────────────────────────────────────────────
@@ -95,6 +157,16 @@ export interface EngineConfig {
   // ── Timeouts ─────────────────────────────────────────────────────────
   playerReadyTimeout: number;
   renderReadyTimeout: number;
+  /**
+   * Puppeteer `page.goto()` navigation timeout for the entry HTML, in ms.
+   * The browser must reach `domcontentloaded` within this budget — heavy
+   * compositions (many videos, large fonts, hundreds of asset requests)
+   * can blow past the default 60s on cold cache. Default: 60_000.
+   *
+   * Env fallback: `PRODUCER_PAGE_NAVIGATION_TIMEOUT_MS`.
+   * CLI flag: `--browser-timeout <seconds>`.
+   */
+  pageNavigationTimeout: number;
 
   // ── Runtime ──────────────────────────────────────────────────────────
   /** Verify Hyperframe runtime SHA256 checksums. */
@@ -144,11 +216,17 @@ export const DEFAULT_CONFIG: EngineConfig = {
 
   disableGpu: false,
   browserGpuMode: "software",
-  enableBrowserPool: false,
+  enableBrowserPool: true,
   browserTimeout: 120_000,
   protocolTimeout: 300_000,
   forceScreenshot: false,
+  staticFrameDedup: true,
+  // Auto-detected per host in `resolveConfig`; defaults off for the raw
+  // DEFAULT_CONFIG (used directly by tests and worker-sizing fallbacks).
+  lowMemoryMode: false,
+  enablePageSideCompositing: true,
 
+  vp9CpuUsed: DEFAULT_VP9_CPU_USED,
   enableChunkedEncode: false,
   chunkSizeFrames: 360,
   enableStreamingEncode: true,
@@ -167,11 +245,73 @@ export const DEFAULT_CONFIG: EngineConfig = {
 
   playerReadyTimeout: 45_000,
   renderReadyTimeout: 15_000,
+  pageNavigationTimeout: 60_000,
 
   verifyRuntime: true,
 
   debug: false,
 };
+
+/**
+ * Reference canvas area for the baseline `protocolTimeout`: 1080p. A single CDP
+ * call (`Runtime.callFunctionOn` seek+paint, or `Page.captureScreenshot`)
+ * scales with the *output pixel area* it has to render/serialize — NOT with the
+ * frame count (that governs total wall-clock, capped separately by the ffmpeg
+ * streaming inactivity timeout). A fixed 300s ceiling intermittently kills
+ * legitimate slow-but-valid renders on large canvases with
+ * `Runtime.callFunctionOn timed out`, so we scale the per-call ceiling with
+ * area.
+ */
+const PROTOCOL_TIMEOUT_REFERENCE_PIXELS = 1920 * 1080;
+
+/**
+ * Absolute ceiling on the scaled protocol timeout (30 minutes). Bounds the
+ * blast radius: a genuinely wedged CDP call must still eventually fail rather
+ * than hang for an unbounded time on a pathologically large composition.
+ */
+const MAX_SCALED_PROTOCOL_TIMEOUT_MS = 1_800_000;
+
+/**
+ * Scale a base `protocolTimeout` up for oversized compositions.
+ *
+ * Scales by output pixel area (`width*height / reference`) — where width/height
+ * are the *device-scaled output* dimensions (the pixels a single CDP call
+ * actually renders/serializes), not the CSS composition size. Clamped to
+ * `[baseTimeout, max(baseTimeout, MAX_SCALED_PROTOCOL_TIMEOUT_MS)]`: never
+ * scales DOWN (a small composition — or a base already above the ceiling —
+ * keeps the configured base), and only ever raises. Pure function; exported
+ * for tests.
+ */
+export function scaleProtocolTimeoutForComposition(
+  baseTimeoutMs: number,
+  dims: { width: number; height: number },
+): number {
+  const { width, height } = dims;
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    return baseTimeoutMs;
+  }
+  const factor = (width * height) / PROTOCOL_TIMEOUT_REFERENCE_PIXELS;
+  if (factor <= 1) return baseTimeoutMs;
+  const scaled = Math.ceil(baseTimeoutMs * factor);
+  // Ceiling is `max(base, MAX)` so an explicit base above the ceiling is never
+  // lowered (preserves the "only ever raise" contract for all callers).
+  const ceiling = Math.max(baseTimeoutMs, MAX_SCALED_PROTOCOL_TIMEOUT_MS);
+  return Math.min(ceiling, Math.max(baseTimeoutMs, scaled));
+}
+
+function memoryAdaptiveCacheLimit(): number {
+  const total = getSystemTotalMb();
+  if (total < 4096) return 32;
+  if (total <= LOW_MEMORY_TOTAL_MB_THRESHOLD) return 64;
+  return DEFAULT_CONFIG.frameDataUriCacheLimit;
+}
+
+function memoryAdaptiveCacheBytesMb(): number {
+  const total = getSystemTotalMb();
+  if (total < 4096) return 128;
+  if (total <= LOW_MEMORY_TOTAL_MB_THRESHOLD) return 256;
+  return DEFAULT_CONFIG.frameDataUriCacheBytesLimitMb;
+}
 
 /**
  * Resolve configuration by merging: defaults ← env vars ← explicit overrides.
@@ -191,10 +331,27 @@ export function resolveConfig(overrides?: Partial<EngineConfig>): EngineConfig {
     if (raw === undefined) return fallback;
     return raw === "true";
   };
+  const envVp9CpuUsed = (): number => {
+    const raw = env("PRODUCER_VP9_CPU_USED");
+    if (raw === undefined || raw === "") return DEFAULT_CONFIG.vp9CpuUsed;
+    return normalizeVp9CpuUsed(Number(raw));
+  };
   const envBrowserGpuMode = (): EngineConfig["browserGpuMode"] => {
     const raw = env("PRODUCER_BROWSER_GPU_MODE");
     if (raw === "hardware" || raw === "software" || raw === "auto") return raw;
     return DEFAULT_CONFIG.browserGpuMode;
+  };
+  // Tri-state: explicit on/off via env, otherwise auto-detect from total RAM.
+  const resolveLowMemoryMode = (): boolean => {
+    const raw = env("PRODUCER_LOW_MEMORY_MODE")?.toLowerCase();
+    if (raw === "true" || raw === "on" || raw === "1") return true;
+    if (raw === "false" || raw === "off" || raw === "0") return false;
+    return isLowMemorySystem();
+  };
+  // Opt-OUT: default ON, disabled only by an explicit falsey value.
+  const resolveStaticFrameDedup = (): boolean => {
+    const raw = env("HF_STATIC_DEDUP")?.trim().toLowerCase();
+    return !(raw === "false" || raw === "off" || raw === "0");
   };
 
   // Env-var layer (backward compat)
@@ -221,7 +378,14 @@ export function resolveConfig(overrides?: Partial<EngineConfig>): EngineConfig {
       : undefined,
 
     forceScreenshot: envBool("PRODUCER_FORCE_SCREENSHOT", DEFAULT_CONFIG.forceScreenshot),
+    staticFrameDedup: resolveStaticFrameDedup(),
+    lowMemoryMode: resolveLowMemoryMode(),
+    enablePageSideCompositing: envBool(
+      "HF_PAGE_SIDE_COMPOSITING",
+      DEFAULT_CONFIG.enablePageSideCompositing,
+    ),
 
+    vp9CpuUsed: envVp9CpuUsed(),
     enableChunkedEncode: envBool(
       "PRODUCER_ENABLE_CHUNKED_ENCODE",
       DEFAULT_CONFIG.enableChunkedEncode,
@@ -259,14 +423,11 @@ export function resolveConfig(overrides?: Partial<EngineConfig>): EngineConfig {
     audioGain: envNum("PRODUCER_AUDIO_GAIN", DEFAULT_CONFIG.audioGain),
     frameDataUriCacheLimit: Math.max(
       32,
-      envNum("PRODUCER_FRAME_DATA_URI_CACHE_LIMIT", DEFAULT_CONFIG.frameDataUriCacheLimit),
+      envNum("PRODUCER_FRAME_DATA_URI_CACHE_LIMIT", memoryAdaptiveCacheLimit()),
     ),
     frameDataUriCacheBytesLimitMb: Math.max(
       64,
-      envNum(
-        "PRODUCER_FRAME_DATA_URI_CACHE_BYTES_MB",
-        DEFAULT_CONFIG.frameDataUriCacheBytesLimitMb,
-      ),
+      envNum("PRODUCER_FRAME_DATA_URI_CACHE_BYTES_MB", memoryAdaptiveCacheBytesMb()),
     ),
 
     playerReadyTimeout: envNum(
@@ -276,6 +437,10 @@ export function resolveConfig(overrides?: Partial<EngineConfig>): EngineConfig {
     renderReadyTimeout: envNum(
       "PRODUCER_RENDER_READY_TIMEOUT_MS",
       DEFAULT_CONFIG.renderReadyTimeout,
+    ),
+    pageNavigationTimeout: envNum(
+      "PRODUCER_PAGE_NAVIGATION_TIMEOUT_MS",
+      DEFAULT_CONFIG.pageNavigationTimeout,
     ),
 
     verifyRuntime: env("PRODUCER_VERIFY_HYPERFRAME_RUNTIME") !== "false",
@@ -287,9 +452,13 @@ export function resolveConfig(overrides?: Partial<EngineConfig>): EngineConfig {
   // Remove undefined values so they don't override defaults
   const cleanEnv = Object.fromEntries(Object.entries(fromEnv).filter(([, v]) => v !== undefined));
 
-  return {
+  const merged = {
     ...DEFAULT_CONFIG,
     ...cleanEnv,
     ...overrides,
+  };
+  return {
+    ...merged,
+    vp9CpuUsed: normalizeVp9CpuUsed(merged.vp9CpuUsed),
   };
 }

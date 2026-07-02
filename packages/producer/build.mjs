@@ -15,11 +15,31 @@ mkdirSync("dist", { recursive: true });
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 
+// The banner provides a real `require` (via createRequire) plus the CJS-only
+// `__filename`/`__dirname` globals so esbuild's CJS interop works in ESM output.
+// Without `require`, bundled CJS deps (recast, yauzl, etc.) that call
+// require("fs") throw "Dynamic require of 'fs' is not supported"; without the
+// dirname shims, deps like wawoff2 throw "__dirname is not defined in ES module".
+const cjsBanner = {
+  js: `import { createRequire as __cjsRequire } from 'module';
+import { fileURLToPath as __cjsFileURLToPath } from 'url';
+import { dirname as __cjsDirname } from 'path';
+const require = __cjsRequire(import.meta.url);
+const __filename = __cjsFileURLToPath(import.meta.url);
+const __dirname = __cjsDirname(__filename);`,
+};
+
 const workspaceAliasPlugin = {
   name: "workspace-alias",
   setup(build) {
     build.onResolve({ filter: /^@hyperframes\/engine$/ }, () => ({
       path: resolve(scriptDir, "../engine/src/index.ts"),
+    }));
+    build.onResolve({ filter: /^@hyperframes\/engine\/alpha-blit$/ }, () => ({
+      path: resolve(scriptDir, "../engine/src/utils/alphaBlit.ts"),
+    }));
+    build.onResolve({ filter: /^@hyperframes\/engine\/shader-transitions$/ }, () => ({
+      path: resolve(scriptDir, "../engine/src/utils/shaderTransitions.ts"),
     }));
     build.onResolve({ filter: /^@hyperframes\/core$/ }, () => ({
       path: resolve(scriptDir, "../core/src/index.ts"),
@@ -30,31 +50,32 @@ const workspaceAliasPlugin = {
   },
 };
 
+const sharedOpts = {
+  bundle: true,
+  platform: "node",
+  target: "node22",
+  format: "esm",
+  external: ["puppeteer", "esbuild", "postcss"],
+  plugins: [workspaceAliasPlugin],
+  minify: false,
+  sourcemap: true,
+  banner: cjsBanner,
+};
+
 await Promise.all([
+  build({ ...sharedOpts, entryPoints: ["src/index.ts"], outfile: "dist/index.js" }),
+  build({ ...sharedOpts, entryPoints: ["src/server.ts"], outfile: "dist/public-server.js" }),
   build({
-    bundle: true,
-    platform: "node",
-    target: "node22",
-    format: "esm",
-    external: ["puppeteer", "esbuild", "postcss"],
-    plugins: [workspaceAliasPlugin],
-    minify: false,
-    sourcemap: true,
-    entryPoints: ["src/index.ts"],
-    outfile: "dist/index.js",
+    ...sharedOpts,
+    entryPoints: ["src/services/shaderTransitionWorker.ts"],
+    outfile: "dist/services/shaderTransitionWorker.js",
   }),
   build({
-    bundle: true,
-    platform: "node",
-    target: "node22",
-    format: "esm",
-    external: ["puppeteer", "esbuild", "postcss"],
-    plugins: [workspaceAliasPlugin],
-    minify: false,
-    sourcemap: true,
-    entryPoints: ["src/server.ts"],
-    outfile: "dist/public-server.js",
+    ...sharedOpts,
+    entryPoints: ["src/services/healthWorkerThread.ts"],
+    outfile: "dist/services/healthWorkerThread.js",
   }),
+  build({ ...sharedOpts, entryPoints: ["src/distributed.ts"], outfile: "dist/distributed.js" }),
 ]);
 
 // Copy core runtime artifacts so the producer can find them at dist/
